@@ -1,0 +1,54 @@
+Django==5.2.7
+djangorestframework==3.16.1
+djangorestframework_simplejwt==5.5.1
+drf-spectacular==0.28.0
+PyJWT==2.10.1
+psycopg2-binary==2.9.11
+python-decouple==3.8
+jsonschema==4.25.1
+jsonschema-specifications==2025.9.1
+referencing==0.36.2
+rpds-py==0.27.1
+
+# Phase 2 - Sarvam Speech-to-Text (docs/phase2-sarvam-stt.md §Provider abstraction).
+# sarvamai is the official Sarvam SDK: required because the Batch STT API's "start
+# job" REST endpoint is not published in Sarvam's plain HTTP docs, only exposed via
+# this SDK (verified 2026-09 - see docs/phase2-sarvam-stt.md). Everything below it is
+# its own transitive dependency closure, pinned flatly per this project's existing
+# convention (docs/pms-reference-analysis.md §11).
+sarvamai==0.1.34
+httpx==0.28.1
+pydantic==2.13.5
+pydantic_core==2.46.5
+typing_extensions==4.16.0
+typing-inspection==0.4.4
+annotated-types==0.8.0
+anyio==4.15.1
+certifi==2026.7.22
+h11==0.16.0
+httpcore==1.0.9
+idna==3.20
+# Pinned to the version google-genai (below) actually resolves to - a strict
+# subset of sarvamai's own >=12.0 constraint, so this single shared pin satisfies
+# both packages (verified: `pip check` reports no conflicts after installing both).
+websockets==16.1.1
+
+# Phase 4 - Gemini eDAR extraction (docs/phase4-gemini-edar-extraction.md
+# §Dependency rule). google-genai is the official, currently-recommended Google SDK
+# (not the deprecated google-generativeai) - verified 2026-09 against
+# ai.google.dev and by reading the installed package source directly (not assumed
+# from an old tutorial). Everything below it is its own transitive dependency
+# closure, pinned flatly per this project's existing convention.
+google-genai==2.24.0
+google-auth==2.58.0
+requests==2.34.2
+cryptography==50.0.1
+cffi==2.1.1
+pycparser==3.0
+pyasn1==0.6.4
+pyasn1_modules==0.4.2
+charset-normalizer==3.5.1
+urllib3==2.8.0
+distro==1.9.0
+sniffio==1.3.1
+tenacity==9.1.4

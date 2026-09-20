@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crashcopilot.internal/schemas/edar-schema.json",
+  "title": "eDAR Extraction Schema",
+  "description": "Fixed, versioned set of 42 eDAR fields the Crash Scene Co-Pilot targets, grouped into 7 modules. Source: 'Crash Scene Co-Pilot - eDAR Fields' document, section 1. Field count and grouping must not be changed without updating that source document first (see docs/architecture-decisions.md ADR-006).",
+  "schema_version": "0.1.0",
+  "field_count": 42,
+  "max_vehicles": 3,
+  "max_casualties": null,
+  "unknown_value_policy": "docs/unknown-data-policy.md",
+  "provenance_contract": "docs/data-provenance.md",
+  "modules": [
+    {
+      "module_id": "A",
+      "name": "Crash Identification",
+      "repeatable": false,
+      "field_count": 6,
+      "fields": [
+        { "field_key": "crash_date", "name": "Crash date", "data_type": "date", "required": true, "example": "2026-05-14", "source_note": "e.g. 'aaj, 14 May' / 'today morning'" },
+        { "field_key": "crash_time", "name": "Crash time", "data_type": "time", "format": "HH:MM", "required": true, "example": "08:30", "source_note": "e.g. 'saade aath baje' / 'around 8:30 AM'" },
+        { "field_key": "gps_coordinates", "name": "GPS coordinates", "data_type": "geopoint", "required": true, "source": "device", "source_note": "Auto-captured by phone GPS - NOT an AI extraction target, see ADR-012" },
+        { "field_key": "road_name", "name": "Road name / NH number", "data_type": "string", "required": false, "example": "NH-37 near Khanapara" },
+        { "field_key": "police_station_jurisdiction", "name": "Police station jurisdiction", "data_type": "string", "required": false, "resolution": "gps_and_or_spoken_lookup", "source_note": "Inferred from GPS or spoken - see ADR-014 and open-decisions.md OD-004" },
+        { "field_key": "case_fir_number", "name": "Case / FIR number", "data_type": "string", "required": false, "example": "142/2026" }
+      ]
+    },
+    {
+      "module_id": "B",
+      "name": "Road & Environment",
+      "repeatable": false,
+      "field_count": 8,
+      "fields": [
+        { "field_key": "road_type", "name": "Road type", "data_type": "categorical", "class_count": 5, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "National Highway" },
+        { "field_key": "road_surface_condition", "name": "Road surface condition", "data_type": "categorical", "class_count": 4, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "wet road" },
+        { "field_key": "road_geometry", "name": "Road geometry", "data_type": "categorical", "class_count": 6, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "sharp bend" },
+        { "field_key": "traffic_control_device", "name": "Traffic control device", "data_type": "multi_label_categorical", "class_count": null, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "broken sign" },
+        { "field_key": "lighting_condition", "name": "Lighting condition", "data_type": "categorical", "class_count": 4, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "dark" },
+        { "field_key": "weather_at_time_of_crash", "name": "Weather at time of crash", "data_type": "categorical", "class_count": 5, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "heavy fog" },
+        { "field_key": "speed_limit_on_road", "name": "Speed limit on road", "data_type": "integer", "unit": "km/h", "example": 60 },
+        { "field_key": "road_features_present", "name": "Road features present", "data_type": "multi_label_categorical", "class_count": null, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "divider present" }
+      ]
+    },
+    {
+      "module_id": "C",
+      "name": "Crash Characteristics",
+      "repeatable": false,
+      "field_count": 7,
+      "fields": [
+        { "field_key": "crash_type", "name": "Crash type", "data_type": "categorical", "class_count": 10, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "rear-end" },
+        { "field_key": "number_of_vehicles_involved", "name": "Number of vehicles involved", "data_type": "integer", "example": 2 },
+        { "field_key": "number_of_persons_involved", "name": "Number of persons involved", "data_type": "integer", "example": 3 },
+        { "field_key": "primary_causation_factor", "name": "Primary causation factor", "data_type": "categorical", "class_count": 15, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "overspeeding" },
+        { "field_key": "secondary_causation_factor", "name": "Secondary causation factor", "data_type": "categorical", "class_count": 15, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "road was slippery" },
+        { "field_key": "point_of_impact", "name": "Point of impact", "data_type": "categorical", "class_count": 8, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "front of truck" },
+        { "field_key": "hit_and_run_flag", "name": "Hit-and-run flag", "data_type": "boolean", "example": true }
+      ]
+    },
+    {
+      "module_id": "D",
+      "name": "Vehicle Details",
+      "repeatable": true,
+      "repeat_entity": "vehicle",
+      "max_repetitions": 3,
+      "field_key_pattern": "vehicle.<n>.<field>",
+      "field_count": 7,
+      "fields": [
+        { "field_key": "vehicle_type", "name": "Vehicle type", "data_type": "categorical", "class_count": 12, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "truck" },
+        { "field_key": "vehicle_registration_number", "name": "Vehicle registration number", "data_type": "string", "format": "regex", "example": "AS-01-AB-1234" },
+        { "field_key": "vehicle_age_year", "name": "Vehicle age / year", "data_type": "integer", "example": 2010 },
+        { "field_key": "vehicle_condition_pre_crash", "name": "Vehicle condition pre-crash", "data_type": "categorical", "class_count": null, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "brakes failed" },
+        { "field_key": "vehicle_manoeuvre_before_crash", "name": "Vehicle manoeuvre before crash", "data_type": "categorical", "class_count": 10, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "was overtaking" },
+        { "field_key": "driver_licence_status", "name": "Driver licence status", "data_type": "categorical_or_boolean", "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "no licence found" },
+        { "field_key": "owner_driver_same_person", "name": "Owner / driver same person", "data_type": "boolean", "example": true }
+      ]
+    },
+    {
+      "module_id": "E",
+      "name": "Casualty Details",
+      "repeatable": true,
+      "repeat_entity": "casualty",
+      "max_repetitions": null,
+      "field_key_pattern": "casualty.<n>.<field>",
+      "field_count": 6,
+      "fields": [
+        { "field_key": "person_type", "name": "Person type", "data_type": "categorical", "class_count": 6, "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "pedestrian" },
+        { "field_key": "injury_severity", "name": "Injury severity", "data_type": "ordinal", "levels": 4, "allowed_values": ["fatal", "grievous injury", "minor injury", "no injury"], "allowed_values_status": "resolved_from_source", "example": "minor injury" },
+        { "field_key": "age_approximate", "name": "Age (approximate)", "data_type": "integer_or_range", "example": 35 },
+        { "field_key": "gender", "name": "Gender", "data_type": "categorical", "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "female" },
+        { "field_key": "helmet_seatbelt_worn", "name": "Helmet / seatbelt worn", "data_type": "boolean", "example": false },
+        { "field_key": "hospitalised_hospital_name", "name": "Hospitalised / hospital name", "data_type": "string", "example": "GNRC" }
+      ]
+    },
+    {
+      "module_id": "F",
+      "name": "Infrastructure Observations",
+      "repeatable": false,
+      "field_count": 5,
+      "notes": "Almost never captured in manual FIRs but critical for black-spot analysis and road-engineering interventions.",
+      "fields": [
+        { "field_key": "street_lighting_functional", "name": "Street lighting functional", "data_type": "boolean", "example": false },
+        { "field_key": "road_markings_visible", "name": "Road markings visible", "data_type": "categorical", "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "no lane markings" },
+        { "field_key": "signage_present_and_visible", "name": "Signage present and visible", "data_type": "categorical_or_text", "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "speed sign broken" },
+        { "field_key": "footpath_shoulder_present", "name": "Footpath / shoulder present", "data_type": "boolean", "example": false },
+        { "field_key": "road_damage_or_obstruction", "name": "Road damage or obstruction", "data_type": "text_or_categorical", "allowed_values": null, "allowed_values_status": "unresolved_open_decision", "example": "big pothole at the spot" }
+      ]
+    },
+    {
+      "module_id": "G",
+      "name": "Officer Assessment",
+      "repeatable": false,
+      "field_count": 3,
+      "fields": [
+        { "field_key": "suspected_alcohol_drug_involvement", "name": "Suspected alcohol / drug involvement", "data_type": "boolean_with_confidence", "example": true },
+        { "field_key": "witness_present", "name": "Witness present", "data_type": "boolean", "example": true },
+        { "field_key": "officer_remarks", "name": "Officer remarks / free text", "data_type": "free_text" }
+      ]
+    }
+  ]
+}

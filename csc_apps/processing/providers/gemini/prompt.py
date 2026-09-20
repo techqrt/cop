@@ -1,0 +1,124 @@
+"""The eDAR extraction prompt (docs/phase4-gemini-edar-extraction.md §Extraction
+prompt, source instructions §49-50). Kept as a dedicated, versioned template - not
+built inline inside a view or service - so it can be reasoned about, tested, and
+compared across versions independently of the code that calls Gemini.
+"""
+
+from csc_apps.processing.providers.gemini.schema_adapter import GPS_FIELD_KEY, MAX_CASUALTIES
+
+# Bump this whenever the prompt's instructions change in a way that could affect
+# extraction behavior - recorded in EdarFieldValue.extraction_version alongside the
+# model and eDAR schema version (docs/phase4-gemini-edar-extraction.md §Provenance,
+# source instructions §50) so a later prompt change never retroactively looks like it
+# produced older extractions.
+PROMPT_VERSION = 'v1'
+
+_ROLE_AND_TASK = """\
+You are a crash-scene information extraction system used by a police records \
+platform. You are given the English-language transcript of a traffic-police \
+officer's spoken statement at a crash scene, and a fixed set of eDAR (electronic \
+Detailed Accident Report) fields. Your task is to extract, from that transcript \
+only, whatever information it actually supports for each of those fields."""
+
+_SOURCE_AND_NO_INVENTION_RULES = """\
+RULES (follow all of these exactly):
+
+1. The transcript below is your ONLY source of fact. Do not use general world \
+knowledge, typical-crash assumptions, or statistics to fill in a field.
+2. Do not invent facts. Do not infer a detail the officer did not state, even if it \
+seems statistically likely (e.g. do not assume daylight, clear weather, dry roads, \
+or a specific speed limit unless the officer actually says so).
+3. If a field is not supported by the transcript, its value MUST be null. A null \
+value is correct and expected for most fields most of the time - do not treat \
+"leaving many fields null" as a failure.
+4. Preserve uncertainty. If the officer expresses doubt ("I believe...", "around...", \
+"I'm not sure whether...", "I couldn't determine..."), do not convert that into a \
+confident value. For a field where the schema allows an approximate representation \
+(e.g. age), you may record the approximate value as stated (e.g. "around 30"). For a \
+plain boolean field where the officer's statement is genuinely uncertain rather than \
+a stated fact, leave the value null rather than guessing true or false.
+5. Never confuse "false" with "unknown". Only set a boolean field to false if the \
+transcript affirmatively states the negative (e.g. "he was not wearing a helmet"). \
+If the transcript simply never mentions the topic, or the officer says they \
+couldn't determine it, the value is null - not false.
+6. Preserve numbers and identifiers exactly as stated (vehicle registration numbers, \
+FIR/case numbers, ages, speed limits). Do not round, reformat, or "correct" them.
+7. Extract only the vehicles and persons the transcript actually provides evidence \
+for. Do not invent a vehicle or a person to fill out the data. Never describe more \
+than 3 vehicles - if the transcript describes more than 3, extract the 3 the \
+transcript gives the clearest, most complete information about, and leave the \
+others out entirely (do not fabricate a partial 4th entry).
+8. For date fields, extract the crash date only if the transcript states or clearly \
+implies it (e.g. "today"). Never substitute the current date, an upload date, or any \
+other system timestamp - if it isn't in the transcript, leave it null.
+9. For every field where you provide a non-null value, also provide: a confidence \
+score from 0.0 to 1.0 reflecting how directly the transcript supports that exact \
+value (not a generic high number), and the short verbatim (or near-verbatim) excerpt \
+of the transcript that supports it. If value is null, confidence and evidence must \
+also be null.
+10. Do not decide GPS coordinates or police-station jurisdiction from map knowledge - \
+only report a jurisdiction if the officer actually names one aloud."""
+
+_STRUCTURED_OUTPUT_INSTRUCTION = """\
+Respond with structured JSON matching exactly the schema provided to you via this \
+request's response schema. Do not add commentary, markdown formatting, or any text \
+outside the JSON object. Do not add fields that are not in the schema. The \
+"vehicles" array must never contain more than 3 items. The "casualties" array must \
+never contain more than {max_casualties} items."""
+
+
+def _field_reference_line(field_def: dict) -> str:
+    parts = [f"- {field_def['field_key']} ({field_def['name']}): type={field_def['data_type']}"]
+    if field_def.get('allowed_values_status') == 'resolved_from_source' and field_def.get('allowed_values'):
+        parts.append(f"allowed values: {', '.join(field_def['allowed_values'])}")
+    elif field_def['data_type'] in ('categorical', 'multi_label_categorical', 'ordinal'):
+        parts.append('no fixed value list defined yet - use a short, natural phrase describing the category')
+    note = field_def.get('source_note') or field_def.get('notes')
+    example = field_def.get('example')
+    if note:
+        parts.append(f'note: {note}')
+    elif example is not None:
+        parts.append(f'example: {example!r}')
+    return ' | '.join(parts)
+
+
+def _module_reference(module: dict, exclude: tuple[str, ...] = ()) -> str:
+    lines = [f"Module {module['module_id']} - {module['name']}:"]
+    for field_def in module['fields']:
+        if field_def['field_key'] in exclude:
+            continue
+        lines.append(_field_reference_line(field_def))
+    return '\n'.join(lines)
+
+
+def build_field_reference(edar_schema: dict) -> str:
+    """Human-readable field-by-field reference block (source instructions §16: "the
+    prompt must contain... field name, description, expected type, allowed values
+    where applicable, extraction instructions" - not just a bare field-name list),
+    derived from the same authoritative schemas/edar-schema.json every other part of
+    this system uses."""
+    modules_by_id = {m['module_id']: m for m in edar_schema['modules']}
+    sections = [
+        _module_reference(modules_by_id['A'], exclude=(GPS_FIELD_KEY,)),
+        _module_reference(modules_by_id['B']),
+        _module_reference(modules_by_id['C']),
+        _module_reference(modules_by_id['D']) + '\n(one such object per vehicle, in a top-level "vehicles" array, max 3)',
+        _module_reference(modules_by_id['E']) + '\n(one such object per person, in a top-level "casualties" array)',
+        _module_reference(modules_by_id['F']),
+        _module_reference(modules_by_id['G']),
+    ]
+    return '\n\n'.join(sections)
+
+
+def build_extraction_prompt(english_text: str, edar_schema: dict) -> str:
+    """The complete prompt sent to Gemini for one extraction call. `english_text` is
+    included verbatim - never summarized, rewritten, or truncated before this point
+    (docs/phase4-gemini-edar-extraction.md §9, §75)."""
+    return '\n\n'.join([
+        _ROLE_AND_TASK,
+        _SOURCE_AND_NO_INVENTION_RULES,
+        'FIELD REFERENCE:\n\n' + build_field_reference(edar_schema),
+        _STRUCTURED_OUTPUT_INSTRUCTION.format(max_casualties=MAX_CASUALTIES),
+        'TRANSCRIPT (the officer\'s statement, already translated to English):\n"""\n'
+        + english_text + '\n"""',
+    ])
