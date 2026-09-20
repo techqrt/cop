@@ -19,7 +19,7 @@ from django.utils import timezone
 from csc_apps.activity_log.models import ActivityLog
 from csc_apps.edar.models import EdarFieldValue, EdarRecord
 from csc_apps.edar.schema_loader import load_schema
-from csc_apps.edar.schema_validation import validate_extraction_entry
+from csc_apps.edar.quality_validation import STATUS_INVALID, assess_candidate
 from csc_apps.processing import event_types
 from csc_apps.processing.error_classification import is_retryable
 from csc_apps.processing.models import ProcessingEvent, ProcessingJob
@@ -78,23 +78,41 @@ def run_extraction_job(job_id: int, provider: ExtractionProvider | None = None) 
     schema = load_schema()
     try:
         result = provider.extract(english_text=english_transcript.text, schema=schema)
-        rows = _build_field_value_rows(result, schema)
     except ProviderError as e:
         _record_failure(job, recording, e, duration_seconds=time.monotonic() - start)
         return job
-    except ValueError as e:
-        # A schema/domain-validation failure on otherwise successfully-parsed Gemini
-        # output (docs/phase4-gemini-edar-extraction.md §Validation layers) -
-        # classified the same as a malformed provider response and not blindly
-        # retried (source instructions §30: "do not endlessly retry deterministic
-        # schema violations").
+
+    # Authoritative validation happens here, before anything is persisted or any prior
+    # AI candidate is touched (docs/phase5-validation-provenance.md §Persistence): a
+    # candidate that fails deterministic validation never reaches the delete-then-
+    # create below, so there is no data-loss window for an earlier valid candidate.
+    assessment = _assess(result, schema, english_transcript.text)
+    report = assessment.report
+    if report['status'] == STATUS_INVALID:
+        ProcessingEvent.objects.create(
+            recording=recording, job=job, event_type=event_types.QUALITY_VALIDATION_FAILED,
+            metadata={'errorCount': report['metrics']['errorCount'], 'issues': report['errors']},
+        )
+        # Non-retryable: a deterministic schema/quality violation is not expected to
+        # change on a retry (source instructions §19/§30). The generic message never
+        # includes field values or transcript text.
         _record_failure(
-            job, recording, ProviderError('EXTRACTION_SCHEMA_VALIDATION_FAILED', str(e)),
-            duration_seconds=time.monotonic() - start,
+            job, recording,
+            ProviderError('EXTRACTION_SCHEMA_VALIDATION_FAILED', f'{len(report["errors"])} validation error(s)'),
+            duration_seconds=time.monotonic() - start, report=report,
         )
         return job
 
-    _record_success(job, recording, result, rows, duration_seconds=time.monotonic() - start)
+    ProcessingEvent.objects.create(
+        recording=recording, job=job, event_type=event_types.QUALITY_VALIDATION_SUCCEEDED,
+        metadata={
+            'status': report['status'], 'warningCount': report['metrics']['warningCount'],
+            'knownFields': report['metrics']['knownFields'],
+        },
+    )
+    _record_success(
+        job, recording, english_transcript, result, assessment, duration_seconds=time.monotonic() - start
+    )
     return job
 
 
@@ -120,70 +138,58 @@ def _entry_from_extracted_field(field: ExtractedField) -> dict:
     }
 
 
-def _build_field_value_rows(result, schema: dict) -> list[dict]:
-    """Validates every KNOWN field Gemini returned (Layer 1 - structural/type,
-    csc_apps.edar.schema_validation.validate_extraction_entry), then reconciles
-    against the full expected field-key set for this candidate (the 28 flat fields,
-    plus every vehicle/casualty slot Gemini actually considered - result.
-    provider_metadata['vehicle_count']/['casualty_count']) so every attempted field
-    gets a row: `known=KNOWN` with a value, or `known=UNKNOWN` with none
-    (docs/unknown-data-policy.md §2 - a missing row means "not attempted", which
-    would misrepresent a field Gemini genuinely considered and found no evidence
-    for). Raises ValueError (caught by the caller) on the first validation failure -
-    the whole candidate is rejected together, never partially accepted."""
-    known_entries = {}
-    for field in result.fields:
-        entry = _entry_from_extracted_field(field)
-        validate_extraction_entry(entry, schema=schema)
-        known_entries[entry['field']] = entry
-
+def _assess(result, schema: dict, transcript_text: str):
+    """Builds the entry dicts and the full expected field-key set (the 28 flat fields
+    plus every vehicle/casualty slot Gemini's `vehicle_count`/`casualty_count`
+    metadata says it considered - docs/unknown-data-policy.md §2: an attempted field
+    with no evidence is `UNKNOWN`, not a missing row), then hands both to the
+    deterministic quality validator (csc_apps.edar.quality_validation)."""
+    entries = [_entry_from_extracted_field(f) for f in result.fields]
     vehicle_count = result.provider_metadata.get('vehicle_count', 0)
     casualty_count = result.provider_metadata.get('casualty_count', 0)
 
     expected_keys = list(flat_field_keys(schema))
+    # Slots beyond the schema's cap are never turned into rows - assess_candidate
+    # reports that as an entity_limit_exceeded error instead.
+    vehicle_slots = min(vehicle_count, _module_max(schema, 'vehicle'))
     vehicle_fields = repeating_field_keys(schema, 'vehicle')
-    for index in range(1, vehicle_count + 1):
+    for index in range(1, vehicle_slots + 1):
         expected_keys.extend(f'vehicle.{index}.{base_key}' for base_key in vehicle_fields)
     casualty_fields = repeating_field_keys(schema, 'casualty')
     for index in range(1, casualty_count + 1):
         expected_keys.extend(f'casualty.{index}.{base_key}' for base_key in casualty_fields)
 
-    rows = []
-    for field_key in expected_keys:
-        entry = known_entries.get(field_key)
-        if entry is not None:
-            rows.append({
-                'field_key': field_key,
-                'known': 'KNOWN',
-                'value': entry['value'],
-                'confidence': entry['confidence'],
-                'source_transcript_segment': entry['source']['transcript_segment'],
-                'source_start_time': entry['source'].get('start_time'),
-                'source_end_time': entry['source'].get('end_time'),
-            })
-        else:
-            rows.append({
-                'field_key': field_key,
-                'known': 'UNKNOWN',
-                'value': None,
-                'confidence': None,
-                'source_transcript_segment': None,
-                'source_start_time': None,
-                'source_end_time': None,
-            })
-    return rows
+    return assess_candidate(
+        entries=entries, expected_keys=expected_keys, transcript_text=transcript_text, schema=schema,
+        vehicle_count=vehicle_count, casualty_count=casualty_count,
+    )
 
 
-def _record_failure(job: ProcessingJob, recording, error: ProviderError, duration_seconds: float) -> None:
+def _module_max(schema: dict, entity: str) -> int:
+    module = next(m for m in schema['modules'] if m.get('repeat_entity') == entity)
+    return module.get('max_repetitions') or 0
+
+
+def _record_failure(
+    job: ProcessingJob, recording, error: ProviderError, duration_seconds: float, report: dict | None = None
+) -> None:
     retryable = is_retryable(error.error_code)
     exhausted = job.attempt_count >= job.max_attempts
     job.status = 'FAILED' if (not retryable or exhausted) else 'RETRYING'
     job.is_retryable = retryable
     job.error_code = error.error_code
     job.error_message = str(error)
+    update_fields = ['status', 'is_retryable', 'error_code', 'error_message', 'completed_at']
+    if report is not None:
+        # The structured, value-free validation report (field / code / severity /
+        # message per issue) - what the API surfaces as `extractionIssues`. Stored on
+        # the failed job rather than as eDAR rows: an INVALID candidate is never
+        # persisted as AI data (docs/phase5-validation-provenance.md §Persistence).
+        job.provider_metadata = {'validation_report': report}
+        update_fields.append('provider_metadata')
     if job.status == 'FAILED':
         job.completed_at = timezone.now()
-    job.save(update_fields=['status', 'is_retryable', 'error_code', 'error_message', 'completed_at'])
+    job.save(update_fields=update_fields)
 
     ProcessingEvent.objects.create(
         recording=recording, job=job, event_type=event_types.EXTRACTION_FAILED,
@@ -197,22 +203,27 @@ def _record_failure(job: ProcessingJob, recording, error: ProviderError, duratio
         },
     )
     logger.warning(
-        'extraction_service.failed job_id=%s recording_id=%s error_code=%s retryable=%s final_status=%s duration=%.2fs',
-        job.job_id, recording.recording_id, error.error_code, retryable, job.status, duration_seconds,
+        'extraction_service.failed job_id=%s recording_id=%s error_code=%s retryable=%s final_status=%s '
+        'validation_errors=%s duration=%.2fs',
+        job.job_id, recording.recording_id, error.error_code, retryable, job.status,
+        report['metrics']['errorCount'] if report else 0, duration_seconds,
     )
 
 
-def _record_success(job: ProcessingJob, recording, result, rows: list[dict], duration_seconds: float) -> None:
+def _record_success(
+    job: ProcessingJob, recording, english_transcript, result, assessment, duration_seconds: float
+) -> None:
+    rows, report = assessment.rows, assessment.report
     with transaction.atomic():
         edar_record, _ = EdarRecord.objects.get_or_create(recording=recording)
 
         # Idempotent, atomic replace (docs/phase4-gemini-edar-extraction.md
-        # §Idempotency, §Transactional persistence, source instructions §36-37): the
-        # AI layer's prior rows (if any, from an earlier attempt) are deleted and the
-        # new validated set is bulk-created in the same transaction - a retry never
-        # leaves stale fields from a previous attempt behind, and a failure partway
-        # through this block rolls back the delete too, so there is never a partially
-        # persisted candidate.
+        # §Idempotency): the AI layer's prior rows are deleted and the new validated
+        # set bulk-created in one transaction, together with the record-level
+        # provenance/quality below - a failure anywhere in this block rolls all of it
+        # back, so status, transcript/job linkage and field rows can never disagree.
+        # The delete only runs here, after validation already passed, so a candidate
+        # that fails validation never removes an earlier valid one.
         EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI').delete()
         EdarFieldValue.objects.bulk_create([
             EdarFieldValue(
@@ -230,17 +241,32 @@ def _record_success(job: ProcessingJob, recording, result, rows: list[dict], dur
             for row in rows
         ])
 
+        # Reprocessing replaces these with the new run's identity - the current AI
+        # candidate always points at the transcript/job/version that produced it.
+        # Historical candidates are not retained (documented limitation).
+        edar_record.quality_status = report['status']
+        edar_record.quality_report = report
+        edar_record.source_transcript = english_transcript
+        edar_record.extraction_job = job
+        edar_record.extracted_at = timezone.now()
+        edar_record.save(
+            update_fields=['quality_status', 'quality_report', 'source_transcript', 'extraction_job', 'extracted_at']
+        )
+
         job.status = 'SUCCEEDED'
         job.completed_at = timezone.now()
-        job.save(update_fields=['status', 'completed_at'])
+        job.provider_metadata = {}
+        job.save(update_fields=['status', 'completed_at', 'provider_metadata'])
 
-        known_count = sum(1 for row in rows if row['known'] == 'KNOWN')
+        metrics = report['metrics']
         ProcessingEvent.objects.create(
             recording=recording, job=job, event_type=event_types.EXTRACTION_SUCCEEDED,
             metadata={
                 'provider': result.provider_name,
-                'field_count': len(rows),
-                'known_field_count': known_count,
+                'field_count': metrics['totalFields'],
+                'known_field_count': metrics['knownFields'],
+                'quality_status': report['status'],
+                'warning_count': metrics['warningCount'],
                 'vehicle_count': result.provider_metadata.get('vehicle_count'),
                 'casualty_count': result.provider_metadata.get('casualty_count'),
                 'duration_seconds': round(duration_seconds, 2),
@@ -248,9 +274,14 @@ def _record_success(job: ProcessingJob, recording, result, rows: list[dict], dur
         )
         ActivityLog.record(
             user=recording.officer, action='Create', model='EdarRecord',
-            details={'recording_id': recording.recording_id, 'job_id': job.job_id, 'known_field_count': known_count},
+            details={
+                'recording_id': recording.recording_id, 'job_id': job.job_id,
+                'known_field_count': metrics['knownFields'], 'quality_status': report['status'],
+            },
         )
     logger.info(
-        'extraction_service.succeeded job_id=%s recording_id=%s known_field_count=%s duration=%.2fs',
-        job.job_id, recording.recording_id, known_count, duration_seconds,
+        'extraction_service.succeeded job_id=%s recording_id=%s extraction_version=%s quality_status=%s '
+        'fields=%s known=%s warnings=%s duration=%.2fs',
+        job.job_id, recording.recording_id, result.extraction_version, report['status'],
+        metrics['totalFields'], metrics['knownFields'], metrics['warningCount'], duration_seconds,
     )

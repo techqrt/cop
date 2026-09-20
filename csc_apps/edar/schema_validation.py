@@ -10,6 +10,19 @@ from csc_apps.edar.schema_loader import load_schema
 _TIME_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
 
 
+class EdarValidationError(ValueError):
+    """A deterministic eDAR validation failure carrying a machine-readable `code`
+    (docs/phase5-validation-provenance.md §Validation layers) so
+    csc_apps.edar.quality_validation can build a structured report without parsing
+    message text. Subclasses ValueError so every pre-Phase-5 caller/test that catches
+    ValueError keeps working unchanged. `str(error)` may contain the offending value
+    and is for internal use only - never exposed through the API."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(message)
+
+
 def resolve_field_key(field_key: str, schema: dict | None = None) -> dict:
     """Returns the schema field definition for `field_key`, which is either a bare
     module A/B/C/F/G field ("crash_date") or a repeating-group entry
@@ -27,7 +40,7 @@ def resolve_field_key(field_key: str, schema: dict | None = None) -> dict:
             for field in module['fields']:
                 if field['field_key'] == base_key:
                     return field
-        raise ValueError(f'"{field_key}" is not a field in any non-repeatable eDAR module')
+        raise EdarValidationError('invalid_field_key', f'"{field_key}" is not a field in any non-repeatable eDAR module')
 
     if len(parts) == 3:
         entity, index_str, base_key = parts
@@ -35,20 +48,21 @@ def resolve_field_key(field_key: str, schema: dict | None = None) -> dict:
             if not module.get('repeatable') or module.get('repeat_entity') != entity:
                 continue
             if not index_str.isdigit() or int(index_str) < 1:
-                raise ValueError(f'"{field_key}" has an invalid repetition index')
+                raise EdarValidationError('invalid_field_key', f'"{field_key}" has an invalid repetition index')
             index = int(index_str)
             max_repetitions = module.get('max_repetitions')
             if max_repetitions is not None and index > max_repetitions:
-                raise ValueError(
-                    f'"{field_key}" exceeds max_repetitions={max_repetitions} for "{entity}"'
+                raise EdarValidationError(
+                    'entity_limit_exceeded',
+                    f'"{field_key}" exceeds max_repetitions={max_repetitions} for "{entity}"',
                 )
             for field in module['fields']:
                 if field['field_key'] == base_key:
                     return field
-            raise ValueError(f'"{base_key}" is not a field of the "{entity}" module')
-        raise ValueError(f'"{entity}" is not a repeatable eDAR entity')
+            raise EdarValidationError('invalid_field_key', f'"{base_key}" is not a field of the "{entity}" module')
+        raise EdarValidationError('invalid_field_key', f'"{entity}" is not a repeatable eDAR entity')
 
-    raise ValueError(f'"{field_key}" is not a well-formed eDAR field key')
+    raise EdarValidationError('invalid_field_key', f'"{field_key}" is not a well-formed eDAR field key')
 
 
 def validate_extraction_entry(entry: dict, schema: dict | None = None) -> None:
@@ -69,20 +83,23 @@ def validate_extraction_entry(entry: dict, schema: dict | None = None) -> None:
     has_confidence = entry.get('confidence') is not None
     has_source = entry.get('source') is not None
     if has_confidence != has_source:
-        raise ValueError(
+        raise EdarValidationError(
+            'provenance_incomplete',
             f'"{entry["field"]}": confidence and source must both be present or both absent '
-            '(docs/ai-extraction-contract.md §3 - no confidence without evidence)'
+            '(docs/ai-extraction-contract.md §3 - no confidence without evidence)',
         )
 
     if has_confidence:
         confidence = entry['confidence']
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not (0 <= confidence <= 1):
-            raise ValueError(f'"{entry["field"]}": confidence must be a float in [0, 1]')
+            raise EdarValidationError('invalid_confidence', f'"{entry["field"]}": confidence must be a float in [0, 1]')
 
         source = entry['source']
         start, end = source.get('start_time'), source.get('end_time')
         if start is not None and end is not None and start > end:
-            raise ValueError(f'"{entry["field"]}": source.start_time is after source.end_time')
+            raise EdarValidationError(
+                'invalid_evidence_timing', f'"{entry["field"]}": source.start_time is after source.end_time'
+            )
 
 
 def _validate_value_type(field_key: str, value, field_def: dict) -> None:
@@ -97,29 +114,33 @@ def _validate_value_type(field_key: str, value, field_def: dict) -> None:
     data_type = field_def['data_type']
 
     if data_type == 'boolean' and not isinstance(value, bool):
-        raise ValueError(f'"{field_key}" is boolean but got {value!r}')
+        raise EdarValidationError('invalid_type', f'"{field_key}" is boolean but got {value!r}')
 
     if data_type == 'integer' and (isinstance(value, bool) or not isinstance(value, int)):
-        raise ValueError(f'"{field_key}" is integer but got {value!r}')
+        raise EdarValidationError('invalid_type', f'"{field_key}" is integer but got {value!r}')
 
     if data_type == 'date':
         if not isinstance(value, str):
-            raise ValueError(f'"{field_key}" is date but got {value!r}')
+            raise EdarValidationError('invalid_type', f'"{field_key}" is date but got {value!r}')
         try:
             datetime.date.fromisoformat(value)
         except ValueError as e:
-            raise ValueError(f'"{field_key}": not a valid ISO date (YYYY-MM-DD): {value!r}') from e
+            raise EdarValidationError(
+                'invalid_type', f'"{field_key}": not a valid ISO date (YYYY-MM-DD): {value!r}'
+            ) from e
 
     if data_type == 'time':
         if not isinstance(value, str) or not _TIME_RE.match(value):
-            raise ValueError(f'"{field_key}": not a valid HH:MM time: {value!r}')
+            raise EdarValidationError('invalid_type', f'"{field_key}": not a valid HH:MM time: {value!r}')
 
     if data_type == 'multi_label_categorical' and not isinstance(value, list):
-        raise ValueError(f'"{field_key}" is multi-label but got {value!r}')
+        raise EdarValidationError('invalid_type', f'"{field_key}" is multi-label but got {value!r}')
 
     if field_def.get('allowed_values_status') == 'resolved_from_source' and field_def.get('allowed_values'):
         allowed = set(field_def['allowed_values'])
         candidates = value if isinstance(value, list) else [value]
         for candidate in candidates:
             if candidate not in allowed:
-                raise ValueError(f'"{field_key}": {candidate!r} is not one of the allowed values {sorted(allowed)}')
+                raise EdarValidationError(
+                    'invalid_enum', f'"{field_key}": {candidate!r} is not one of the allowed values {sorted(allowed)}'
+                )

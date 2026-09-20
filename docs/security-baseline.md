@@ -63,7 +63,12 @@ don't exist yet — `docs/api-architecture.md` §3):
   introduced. Phase 4 introduces one new credential, `GEMINI_API_KEY`, for Google
   Gemini, following the identical pattern (`Configurations.gemini_api_key`, never
   logged, never returned — `docs/phase4-gemini-edar-extraction.md` §18). All three AI
-  provider selections (OD-002) are now resolved.
+  provider selections (OD-002) are now resolved. Phase 5 adds no credential and no
+  provider call. It does start returning per-field `evidence` (a short excerpt of the
+  English transcript) through the existing `GET /recordings/<id>/`, under the same
+  Recording authorization as the transcript itself (owner, REVIEWER, ADMIN); validation
+  issue messages are generic and value-free, so validation output never leaks a value or
+  transcript text beyond that (`docs/phase5-validation-provenance.md` §13).
 - `.env` is git-ignored (`.gitignore`); `.env.example` documents required variable *names*
   with no real values. PMS's own working tree has a local `.env` with real database
   credentials, but it is excluded via PMS's `.gitignore` and was not read into or copied by

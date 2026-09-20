@@ -73,7 +73,7 @@ concrete named constants (`csc_apps/processing/event_types.py`:
 `TRANSLATION_JOB_CREATED`/`TRANSLATION_STARTED`/`TRANSLATION_SUCCEEDED`/
 `TRANSLATION_FAILED`; Phase 4 added `EXTRACTION_JOB_CREATED`/`EXTRACTION_STARTED`/
 `EXTRACTION_SUCCEEDED`/`EXTRACTION_FAILED` (`docs/phase4-gemini-edar-extraction.md`
-§11). The three pipeline stages now cover the full `Audio -> STT -> Translation ->
+§11); Phase 5 added `QUALITY_VALIDATION_SUCCEEDED`/`QUALITY_VALIDATION_FAILED`, emitted inside the extraction stage before its succeeded/failed event (`docs/phase5-validation-provenance.md` §11) - metadata carries counts and status only, never field values or evidence. The three pipeline stages now cover the full `Audio -> STT -> Translation ->
 Extraction` chain end to end, each with its own started/succeeded/failed events plus
 one `<stage>_job_created` event marking automatic chaining from the previous stage's
 success. Still not enforced by a Django `choices` field — even with all three AI

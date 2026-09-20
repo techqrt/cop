@@ -15,7 +15,7 @@ under a path prefix in `csc/urls.py` — the same pattern as PMS's `pms/urls.py`
 |---|---|---|---|
 | Authentication | `/auth/` | `csc_apps.authentication` | Implemented (login) |
 | Recordings (upload) | `POST /recordings/` | `csc_apps.recordings` | Implemented — Phase 1, `docs/phase1-audio-ingestion.md` |
-| Recordings (detail/transcripts/eDAR) | `GET /recordings/<id>/` | `csc_apps.recordings` | Implemented — Phase 2 (`docs/phase2-sarvam-stt.md` §7), extended Phase 3 with the English transcript (`docs/phase3-sarvam-translation.md` §11), extended Phase 4 with the AI eDAR candidate (`docs/phase4-gemini-edar-extraction.md` §15) |
+| Recordings (detail/transcripts/eDAR) | `GET /recordings/<id>/` | `csc_apps.recordings` | Implemented — Phase 2 (`docs/phase2-sarvam-stt.md` §7), extended Phase 3 with the English transcript (`docs/phase3-sarvam-translation.md` §11), extended Phase 4 with the AI eDAR candidate (`docs/phase4-gemini-edar-extraction.md` §15), extended Phase 5 with quality report, per-field evidence/confidence and structured validation issues (`docs/phase5-validation-provenance.md` §12) — no new endpoint |
 | Audio (raw retrieval) | `/recordings/<id>/audio/` | `csc_apps.recordings` | Deferred (OD-012) |
 | Processing | `/recordings/<id>/processing/` | `csc_apps.processing` | Superseded — folded into the combined detail endpoint above rather than built as its own sub-resource (docs/phase2-sarvam-stt.md §7) |
 | eDAR | `/recordings/<id>/edar/` | `csc_apps.edar` | Superseded — AI-candidate eDAR data folded into the combined detail endpoint above (docs/phase4-gemini-edar-extraction.md §15); a dedicated eDAR endpoint may still be added in a later phase for officer editing |

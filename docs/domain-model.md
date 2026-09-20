@@ -107,6 +107,13 @@ EdarRecord (csc_apps/edar)
   edar_record_id PK, recording FK -> Recording (PROTECT, one-to-one)
   review_status     [PENDING_REVIEW|IN_REVIEW|APPROVED]
   reviewed_by FK -> User (nullable), reviewed_at (nullable)
+  # Phase 5 (docs/phase5-validation-provenance.md) - AI-candidate provenance & quality.
+  # Describe the CURRENT AI candidate only; none of it implies approval.
+  quality_status    [VALIDATED|VALIDATION_WARNING|null]   (INVALID candidates are never stored)
+  quality_report (JSON)          structured warnings + count metrics, no accuracy score
+  source_transcript FK -> Transcript (nullable, PROTECT)  the ENGLISH transcript extracted from
+  extraction_job FK -> ProcessingJob (nullable, PROTECT)  the job that produced the candidate
+  extracted_at (nullable)
 
 EdarFieldValue (csc_apps/edar)
   field_value_id PK, edar_record FK -> EdarRecord (PROTECT)

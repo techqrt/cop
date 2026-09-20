@@ -15,20 +15,51 @@ class TranscriptPairSerializer(serializers.Serializer):
     english = TranscriptDataSerializer(read_only=True, allow_null=True)
 
 
+class EdarIssueSerializer(serializers.Serializer):
+    """One structured validation issue. `message` is a generic, value-free description
+    - never the offending value, transcript text, or a provider error."""
+
+    field = serializers.CharField(read_only=True, allow_null=True)
+    code = serializers.CharField(read_only=True)
+    severity = serializers.CharField(read_only=True)
+    message = serializers.CharField(read_only=True)
+
+
+class EdarQualitySerializer(serializers.Serializer):
+    """Deterministic validation outcome of the AI candidate (docs/phase5-validation-
+    provenance.md). status VALIDATED/VALIDATION_WARNING describes validation only -
+    it is NOT approval and NOT a measure of factual accuracy; `metrics` are counts and a
+    field-coverage ratio, deliberately with no accuracy or aggregate confidence score."""
+
+    status = serializers.CharField(read_only=True)
+    errors = EdarIssueSerializer(many=True, read_only=True)
+    warnings = EdarIssueSerializer(many=True, read_only=True)
+    metrics = serializers.DictField(child=serializers.JSONField(), read_only=True)
+
+
+class EdarProvenanceSerializer(serializers.Serializer):
+    sourceTranscriptLanguage = serializers.CharField(read_only=True, allow_null=True)
+    extractionVersion = serializers.CharField(read_only=True, allow_null=True)
+    extractedAt = serializers.CharField(read_only=True, allow_null=True)
+
+
 class EdarFieldDataSerializer(serializers.Serializer):
-    """One eDAR field's AI-layer state (docs/phase4-gemini-edar-extraction.md §API
-    behavior). Deliberately minimal for Phase 4 - `value`/`known`/`confidence` only.
-    Per-field provenance/evidence display is Phase 5's job (source instructions'
-    stop condition), not exposed here even though it is already persisted on
-    EdarFieldValue."""
+    """One eDAR field's AI-layer state (docs/phase5-validation-provenance.md §API
+    representation). `confidence` is a model-generated signal, not a probability of
+    truth; `evidence` is a reference into the English transcript."""
 
     value = serializers.JSONField(read_only=True, allow_null=True)
     known = serializers.CharField(read_only=True)
     confidence = serializers.FloatField(read_only=True, allow_null=True)
+    evidence = serializers.CharField(read_only=True, allow_null=True)
+    evidenceVerified = serializers.BooleanField(read_only=True, allow_null=True)
+    warnings = serializers.ListField(child=serializers.CharField(), read_only=True)
 
 
 class EdarDataSerializer(serializers.Serializer):
     layer = serializers.CharField(read_only=True)
+    quality = EdarQualitySerializer(read_only=True, allow_null=True)
+    provenance = EdarProvenanceSerializer(read_only=True)
     fields = serializers.DictField(child=EdarFieldDataSerializer(), read_only=True)
 
 
@@ -52,6 +83,8 @@ class RecordingDetailDataSerializer(serializers.Serializer):
     failureReason = serializers.CharField(read_only=True, allow_null=True)
     translationFailureReason = serializers.CharField(read_only=True, allow_null=True)
     extractionFailureReason = serializers.CharField(read_only=True, allow_null=True)
+    # Structured, value-free validation errors when extraction failed validation.
+    extractionIssues = EdarIssueSerializer(many=True, read_only=True)
 
 
 class RecordingDetailResponseSerializer(serializers.Serializer):

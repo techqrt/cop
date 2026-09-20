@@ -32,3 +32,9 @@ EXTRACTION_JOB_CREATED = 'extraction_job_created'
 EXTRACTION_STARTED = 'extraction_started'
 EXTRACTION_SUCCEEDED = 'extraction_succeeded'
 EXTRACTION_FAILED = 'extraction_failed'
+
+# Phase 5 - AI eDAR quality validation (docs/phase5-validation-provenance.md
+# §Processing events). Emitted inside the extraction stage, before EXTRACTION_SUCCEEDED
+# / EXTRACTION_FAILED; no new event subsystem.
+QUALITY_VALIDATION_SUCCEEDED = 'quality_validation_succeeded'
+QUALITY_VALIDATION_FAILED = 'quality_validation_failed'

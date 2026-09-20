@@ -227,19 +227,17 @@ class RecordingView:
 
         edar_data = None
         extraction_failure_reason = None
+        extraction_issues = []
         if extraction_status == 'SUCCEEDED':
             edar_record = EdarRecord.objects.filter(recording=recording).first()
             if edar_record is not None:
-                field_rows = EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI')
-                edar_data = {
-                    'layer': 'AI',
-                    'fields': {
-                        row.field_key: {'value': row.value, 'known': row.known, 'confidence': row.confidence}
-                        for row in field_rows
-                    },
-                }
+                edar_data = self._build_edar_data(edar_record)
         elif extraction_status == 'FAILED':
             extraction_failure_reason = extraction_job.error_code
+            # Value-free issue list (field / code / severity / generic message) from the
+            # persisted validation report - never raw provider text or field values.
+            report = (extraction_job.provider_metadata or {}).get('validation_report') or {}
+            extraction_issues = report.get('errors', [])
 
         return Response(
             status=status.HTTP_200_OK,
@@ -255,9 +253,62 @@ class RecordingView:
                     'failureReason': stt_failure_reason,
                     'translationFailureReason': translation_failure_reason,
                     'extractionFailureReason': extraction_failure_reason,
+                    'extractionIssues': extraction_issues,
                 },
             ),
         )
+
+    @staticmethod
+    def _build_edar_data(edar_record) -> dict:
+        """Read-only projection of the persisted AI candidate (docs/phase5-validation-
+        provenance.md §API representation) - nothing here is recomputed or re-validated
+        on read; it only reshapes what extraction already validated and stored. A
+        record written before Phase 5 has no quality report; `quality` is then null
+        rather than a fabricated status."""
+        report = edar_record.quality_report or None
+        warning_codes_by_field: dict[str, list[str]] = {}
+        for item in (report or {}).get('warnings', []):
+            if item.get('field'):
+                warning_codes_by_field.setdefault(item['field'], []).append(item['code'])
+
+        rows = list(EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI'))
+        fields = {}
+        for row in rows:
+            codes = warning_codes_by_field.get(row.field_key, [])
+            has_evidence = bool(row.source_transcript_segment)
+            fields[row.field_key] = {
+                'value': row.value,
+                'known': row.known,
+                # Model-generated signal, not a probability of correctness.
+                'confidence': row.confidence,
+                # A reference into the English transcript, never a second narrative.
+                'evidence': row.source_transcript_segment,
+                # null = no evidence or no report to judge by; true/false only when
+                # traceability was actually checked at extraction time.
+                'evidenceVerified': (
+                    ('evidence_not_traceable' not in codes) if (has_evidence and report is not None) else None
+                ),
+                'warnings': codes,
+            }
+
+        quality = None
+        if report is not None:
+            quality = {
+                'status': edar_record.quality_status or report.get('status'),
+                'errors': report.get('errors', []),
+                'warnings': report.get('warnings', []),
+                'metrics': report.get('metrics', {}),
+            }
+        return {
+            'layer': 'AI',
+            'quality': quality,
+            'provenance': {
+                'sourceTranscriptLanguage': 'ENGLISH' if edar_record.source_transcript_id else None,
+                'extractionVersion': rows[0].extraction_version if rows else None,
+                'extractedAt': edar_record.extracted_at.isoformat() if edar_record.extracted_at else None,
+            },
+            'fields': fields,
+        }
 
     @staticmethod
     def _build_message(processing_status: str, translation_status: str | None, extraction_status: str | None) -> str:

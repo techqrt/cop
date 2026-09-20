@@ -199,3 +199,39 @@ already resolved, ADR-015/ADR-017).
    have meant inventing product decisions Phase 0 deliberately left open.
 
 **Status:** Accepted.
+
+---
+
+### ADR-019 — AI validation is not human approval; confidence is not accuracy; evidence points into the English transcript; the schema stays the source of structure
+
+**Context:** Phase 4 produced a `layer=AI` candidate. Phase 5 adds deterministic
+quality validation and provenance. The risk is a "validated" or high-confidence label
+being read as "correct" or "approved".
+
+**Decision:**
+1. **Validation status is not approval.** `VALIDATED` / `VALIDATION_WARNING` mean the
+   candidate is structurally sound and what a reviewer should look at; nothing in Phase
+   5 writes `layer=APPROVED`, touches `review_status`, or advances the Recording.
+   `INVALID` candidates are rejected (job FAILED, non-retryable
+   `EXTRACTION_SCHEMA_VALIDATION_FAILED`) and never stored; the report is kept on the
+   failed job and any earlier valid AI candidate is left untouched.
+2. **Confidence is a model-generated signal, not accuracy.** Range-checked (0-1, no
+   booleans/NaN), never clamped (out of range = malformed = INVALID), never
+   aggregated into an accuracy score. A low value only raises a `low_confidence`
+   warning (0.5, non-calibrated) and the field is kept.
+3. **Evidence points back to the English transcript.** Each known field carries a
+   transcript excerpt; a normalized substring match (documented rule) checks it exists
+   in that transcript. A mismatch is a per-field `evidence_not_traceable` warning, not
+   an error, because the prompt asks for "verbatim or near-verbatim" evidence. A match
+   proves the text exists, not that it supports the value.
+4. **The schema remains the source of structure.** Types, enums, entity limits come
+   from `schemas/edar-schema.json`; categorical fields with unresolved enums stay
+   free text (OD-013 remains OPEN) - no enum is invented.
+5. **Validate at extraction time, persist the result; GET only reads.** Record-level
+   provenance/quality lives on `EdarRecord`, written in the same transaction as the
+   field rows.
+
+**Consequences:** Only the current candidate is stored (no history); Phase 6 must treat
+quality output as reviewer guidance only.
+
+**Status:** Accepted.

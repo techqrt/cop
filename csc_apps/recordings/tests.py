@@ -590,7 +590,7 @@ class RecordingDetailTranslationAPITests(TestCase):
         self.assertEqual(set(response.data.keys()), {'status', 'message', 'data'})
         expected_data_keys = {
             'recordingId', 'processingStatus', 'translationStatus', 'extractionStatus', 'transcript', 'edar',
-            'failureReason', 'translationFailureReason', 'extractionFailureReason',
+            'failureReason', 'translationFailureReason', 'extractionFailureReason', 'extractionIssues',
         }
         self.assertEqual(set(response.data['data'].keys()), expected_data_keys)
 
@@ -740,13 +740,17 @@ class RecordingDetailExtractionAPITests(TestCase):
         self.assertEqual(data['transcript']['original']['text'], 'gaadi tez chal rahi thi')
         self.assertEqual(data['transcript']['english']['text'], 'The vehicle was speeding')
 
-    def test_raw_gemini_response_and_source_evidence_not_exposed(self):
+    def test_field_evidence_is_exposed_but_raw_provider_internals_are_not(self):
+        # Phase 5 intentionally exposes per-field evidence (a reference into the English
+        # transcript) behind the same Recording authorization; Phase 4 deferred this.
+        # Raw Gemini payloads, request IDs and API details must still never appear.
         self._make_extraction_succeeded_with_fields()
         response = self._get(self.owner)
+        fields = response.data['data']['edar']['fields']
+        self.assertEqual(fields['crash_type']['evidence'], 'hit the rear')
         rendered = str(response.data)
-        self.assertNotIn('hit the rear', rendered)  # source_transcript_segment - Phase 5's concern, not Phase 4's
-        self.assertNotIn('prompt-v1', rendered)  # extraction_version - internal provenance, not API-exposed
-        self.assertNotIn('schema-0.1.0', rendered)
+        for forbidden in ('request_id', 'api_key', 'GEMINI', 'Traceback', 'response_json_schema'):
+            self.assertNotIn(forbidden, rendered)
 
     def test_response_follows_pms_envelope(self):
         self._make_extraction_succeeded_with_fields()

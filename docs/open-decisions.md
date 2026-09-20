@@ -184,6 +184,16 @@ official eDAR/iRAD field specification (not invented ad hoc), then update
 `schemas/edar-schema.json`'s `allowed_values`/`allowed_values_status` for each -
 Gemini's schema and the deterministic validator will pick up a resolved enum
 automatically once present (no code change needed beyond the schema data itself).
+**Phase 5 status (still OPEN, deliberately not resolved):** Phase 5 validation
+(`docs/phase5-validation-provenance.md` §8) checks types, the one resolved enum
+(`injury_severity`), confidence, evidence and counts. It does NOT validate the value of
+any categorical field marked `unresolved_open_decision` - those are accepted as free
+text and merely counted (`freeTextCategoricalFields`). Still unresolved: (1) the
+category list for each of the ~26 unresolved fields; (2) whether a closed list or
+free text is the product decision per field; (3) whether Gemini's free-text should be
+normalised/mapped to a closed list later; (4) how `known` should behave for a value that
+fits no category. Resolution still requires only schema data, then validation tightens
+automatically.
 **Status:** Open.
 
 ---
