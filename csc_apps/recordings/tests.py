@@ -221,6 +221,21 @@ class RecordingUploadAPITests(TestCase):
         self.assertEqual(job.job_type, 'STT')
         self.assertEqual(job.status, 'PENDING')
 
+    def test_upload_above_djangos_default_in_memory_threshold_succeeds(self):
+        # Regression: Django's own default per-file in-memory threshold is 2.5MB;
+        # above it, an uploaded file becomes an on-disk TemporaryUploadedFile
+        # wrapping a real OS file handle. csc_apps.common.serializer_validations
+        # deep-copies request.data to get a mutable QueryDict (`data.copy()`), and
+        # deepcopy cannot copy that handle - every real crash-statement recording
+        # over ~80 seconds of 16kHz WAV hit an unhandled 500 instead of the shared
+        # {status,message,data} envelope (fixed by raising
+        # FILE_UPLOAD_MAX_MEMORY_SIZE in csc/settings.py).
+        large_content = b'RIFF' + b'\x00\x00\x00\x00' + b'WAVE' + b'\x00' * (3 * 1024 * 1024)
+        payload = {'audio': _wav_file(content=large_content)}
+        response = self._client_as(self.officer).post('/recordings/', payload, format='multipart')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(response.data['status'])
+
     def test_unauthenticated_upload_is_rejected(self):
         response = self._upload(APIClient())
         self.assertEqual(response.status_code, 401)

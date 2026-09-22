@@ -11,6 +11,16 @@ GenerateContentConfig(response_mime_type='application/json', response_json_schem
 and `response_json_schema` accepts a raw JSON Schema dict (confirmed by reading
 `GenerateContentConfig`'s own docstring in `types.py`) - this is what
 `csc_apps.processing.providers.gemini.schema_adapter` builds.
+
+One extraction is three of these calls, not one: `response_json_schema` is checked
+against a protobuf Schema with a hard total-complexity ceiling (live-verified
+2026-09), and the single schema describing all 42 fields at once is rejected outright
+(HTTP 400) once vehicles and casualties are added alongside the 28 flat fields,
+independent of any individual field or keyword. `extract()` below calls Gemini once
+each for the flat fields, vehicles, and casualties, then merges the three JSON
+results before validation - the `ExtractionProvider.extract(english_text, schema) ->
+ExtractionResult` interface itself is unchanged; the fan-out is entirely internal to
+this provider.
 """
 
 import json
@@ -27,8 +37,19 @@ from csc_apps.processing.providers.base import (
     FieldSource,
     ProviderError,
 )
-from csc_apps.processing.providers.gemini.prompt import PROMPT_VERSION, build_extraction_prompt
-from csc_apps.processing.providers.gemini.schema_adapter import build_response_schema, repeating_field_keys, flat_field_keys
+from csc_apps.processing.providers.gemini.prompt import (
+    PROMPT_VERSION,
+    build_casualties_extraction_prompt,
+    build_flat_extraction_prompt,
+    build_vehicles_extraction_prompt,
+)
+from csc_apps.processing.providers.gemini.schema_adapter import (
+    build_casualties_response_schema,
+    build_flat_response_schema,
+    build_vehicles_response_schema,
+    flat_field_keys,
+    repeating_field_keys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +91,55 @@ class GeminiExtractionProvider(ExtractionProvider):
         )
 
     def extract(self, english_text: str, schema: dict) -> ExtractionResult:
+        """Three separate Gemini calls - flat crash-level fields, vehicles,
+        casualties - merged into one candidate before validation
+        (docs/phase4-gemini-edar-extraction.md §Structured-output strategy). Not
+        three independent extractions: any one call failing fails the whole
+        extraction (no partial AI eDAR is ever built from two calls' worth of
+        fields), same "all or nothing" guarantee the single-call version gave."""
         if not english_text or not english_text.strip():
             raise ProviderError('EXTRACTION_UNSUPPORTED_INPUT', 'English transcript is empty')
 
         client = self._client()
-        prompt = build_extraction_prompt(english_text, schema)
-        response_schema = build_response_schema(schema)
 
+        flat_candidate = self._call(
+            client, build_flat_extraction_prompt(english_text, schema), build_flat_response_schema(schema)
+        )
+        vehicles_candidate = self._call(
+            client, build_vehicles_extraction_prompt(english_text, schema), build_vehicles_response_schema(schema)
+        )
+        casualties_candidate = self._call(
+            client, build_casualties_extraction_prompt(english_text, schema), build_casualties_response_schema(schema)
+        )
+
+        candidate = {
+            **flat_candidate,
+            'vehicles': vehicles_candidate.get('vehicles'),
+            'casualties': casualties_candidate.get('casualties'),
+        }
+        fields, vehicle_count, casualty_count = self._flatten_candidate(candidate, schema)
+
+        return ExtractionResult(
+            fields=fields,
+            provider_name=self.PROVIDER_NAME,
+            extraction_version=(
+                f'gemini-{self.MODEL}/prompt-{PROMPT_VERSION}/schema-{schema.get("schema_version")}'
+            ),
+            provider_metadata={
+                'model': self.MODEL,
+                'prompt_version': PROMPT_VERSION,
+                'schema_version': schema.get('schema_version'),
+                'vehicle_count': vehicle_count,
+                'casualty_count': casualty_count,
+                'call_count': 3,
+            },
+        )
+
+    def _call(self, client: genai.Client, prompt: str, response_schema: dict) -> dict:
+        """Runs one of the three extraction calls and returns its parsed JSON
+        object. Errors are classified identically regardless of which of the three
+        calls raised them - the caller (extraction_service) only ever sees one
+        extraction attempt, not three independently-retryable ones."""
         try:
             response = client.models.generate_content(
                 model=self.MODEL,
@@ -109,22 +172,7 @@ class GeminiExtractionProvider(ExtractionProvider):
                 'EXTRACTION_MALFORMED_RESPONSE', f'Gemini output was not a JSON object: {type(candidate)}'
             )
 
-        fields, vehicle_count, casualty_count = self._flatten_candidate(candidate, schema)
-
-        return ExtractionResult(
-            fields=fields,
-            provider_name=self.PROVIDER_NAME,
-            extraction_version=(
-                f'gemini-{self.MODEL}/prompt-{PROMPT_VERSION}/schema-{schema.get("schema_version")}'
-            ),
-            provider_metadata={
-                'model': self.MODEL,
-                'prompt_version': PROMPT_VERSION,
-                'schema_version': schema.get('schema_version'),
-                'vehicle_count': vehicle_count,
-                'casualty_count': casualty_count,
-            },
-        )
+        return candidate
 
     @staticmethod
     def _flatten_candidate(candidate: dict, schema: dict) -> tuple[list[ExtractedField], int, int]:

@@ -131,6 +131,17 @@ AUDIO_MAX_UPLOAD_SIZE_BYTES = Configurations.audio_max_upload_size_bytes
 # always the one a client sees for an oversized upload.
 DATA_UPLOAD_MAX_MEMORY_SIZE = AUDIO_MAX_UPLOAD_SIZE_BYTES + 1024 * 1024
 
+# Must also stay above AUDIO_MAX_UPLOAD_SIZE_BYTES: below this per-file threshold
+# (Django's own default is 2.5MB) an uploaded file is an in-memory
+# InMemoryUploadedFile; above it, Django buffers to an on-disk TemporaryUploadedFile
+# wrapping a real OS file handle. csc_apps.common.serializer_validations deep-copies
+# request.data to get a mutable QueryDict (`data.copy()`), and deepcopy cannot copy
+# that file handle (`TypeError: cannot pickle 'BufferedRandom' instances`) - any
+# accepted audio file above the default threshold made every upload past ~2.5MB fail
+# with an unhandled 500 instead of the shared response envelope. Keeping every
+# accepted file in memory sidesteps this entirely.
+FILE_UPLOAD_MAX_MEMORY_SIZE = AUDIO_MAX_UPLOAD_SIZE_BYTES + 1024 * 1024
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 

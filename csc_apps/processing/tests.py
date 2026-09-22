@@ -881,6 +881,33 @@ class TranslationServiceTests(TestCase):
         self.assertEqual(self.job.status, 'FAILED')
         self.assertEqual(self.job.error_code, 'TRANSLATION_UNSUPPORTED_INPUT')
 
+    def test_english_source_transcript_skips_the_provider_and_copies_text_verbatim(self):
+        # Sarvam's translate API rejects source == target ("Source and target
+        # languages must be different") - an English-language statement (STT
+        # detected en-IN) has nothing to translate, so this must never reach the
+        # provider at all (docs/phase3-sarvam-translation.md's Sarvam-error path is
+        # the wrong outcome for a legitimately-English source).
+        self.original_transcript.detected_language_code = 'en-IN'
+        self.original_transcript.text = 'the vehicle was speeding and crashed'
+        self.original_transcript.save()
+        provider = self._mock_provider()
+
+        run_translation_job(self.job.job_id, provider=provider)
+
+        provider.translate.assert_not_called()
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, 'SUCCEEDED')
+        english = Transcript.objects.get(recording=self.recording, language='ENGLISH')
+        self.assertEqual(english.text, self.original_transcript.text)
+        self.assertEqual(english.detected_language_code, 'en-IN')
+        self.assertEqual(english.provider_metadata['source_language_code'], 'en-IN')
+
+    def test_english_source_transcript_still_chains_to_extraction(self):
+        self.original_transcript.detected_language_code = 'en-IN'
+        self.original_transcript.save()
+        run_translation_job(self.job.job_id, provider=self._mock_provider())
+        self.assertTrue(ProcessingJob.objects.filter(recording=self.recording, job_type='EXTRACTION').exists())
+
 
 def _empty_wrapper():
     return {'value': None, 'confidence': None, 'evidence': None}
@@ -918,6 +945,20 @@ def _fake_gemini_response(candidate: dict):
     return response
 
 
+def _fake_gemini_responses(candidate: dict) -> list:
+    """One extraction is three Gemini calls - flat fields, vehicles, casualties, in
+    that order (GeminiExtractionProvider.extract) - so a mocked
+    `generate_content.side_effect` needs one response per call. Splits a single
+    combined `_build_candidate(...)` shape back into the three pieces each call
+    would actually return."""
+    flat_response = {k: v for k, v in candidate.items() if k not in ('vehicles', 'casualties')}
+    return [
+        _fake_gemini_response(flat_response),
+        _fake_gemini_response({'vehicles': candidate['vehicles']}),
+        _fake_gemini_response({'casualties': candidate['casualties']}),
+    ]
+
+
 class GeminiExtractionProviderTests(SimpleTestCase):
     """docs/phase4-gemini-edar-extraction.md §Testing (§61 Provider) - the
     google-genai SDK client is fully mocked; no real network call is ever made."""
@@ -939,12 +980,13 @@ class GeminiExtractionProviderTests(SimpleTestCase):
         )
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.models.generate_content.return_value = _fake_gemini_response(candidate)
+        mock_client.models.generate_content.side_effect = _fake_gemini_responses(candidate)
 
         result = self._provider().extract(english_text='the motorcycle hit the rear of the car', schema=self.schema)
 
         self.assertIsInstance(result, ExtractionResult)
         self.assertEqual(result.provider_name, 'gemini')
+        self.assertEqual(mock_client.models.generate_content.call_count, 3)
         by_field = {f.field: f for f in result.fields}
         self.assertEqual(by_field['crash_type'].value, 'rear-end collision')
         self.assertEqual(by_field['vehicle.1.vehicle_type'].value, 'motorcycle')
@@ -962,7 +1004,7 @@ class GeminiExtractionProviderTests(SimpleTestCase):
         )
         mock_client = MagicMock()
         mock_client_cls.return_value = mock_client
-        mock_client.models.generate_content.return_value = _fake_gemini_response(candidate)
+        mock_client.models.generate_content.side_effect = _fake_gemini_responses(candidate)
 
         result = self._provider().extract(english_text='the motorcycle hit the rear of the car', schema=self.schema)
 

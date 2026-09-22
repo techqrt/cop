@@ -12,9 +12,16 @@ emits still resolves via csc_apps.edar.schema_validation.resolve_field_key).
 GPS_FIELD_KEY = 'gps_coordinates'
 
 # Engineering safety bound, not a product/eDAR rule - the source spec places no cap
-# on casualty count (unlike vehicles, capped at 3 by the schema itself). This only
-# guards the structured-output request against a runaway/degenerate array.
-MAX_CASUALTIES = 20
+# on casualty count (unlike vehicles, capped at 3 by the schema itself). Originally
+# just a guard against a runaway/degenerate array; now load-bearing for a second
+# reason too - Gemini's response_json_schema is checked against a protobuf Schema
+# with a hard total-complexity ceiling, and the casualties call's own schema (6
+# fields x {value,confidence,evidence} each, times maxItems) hits it on its own,
+# independent of the flat-fields and vehicles calls. Live-verified 2026-09 against
+# the real API with this project's actual casualty field set: maxItems=8 is accepted,
+# maxItems=9 is rejected outright (HTTP 400). 6 keeps a small margin below that
+# observed edge rather than sitting exactly on it.
+MAX_CASUALTIES = 6
 
 _FLAT_MODULE_IDS = ('A', 'B', 'C', 'F', 'G')
 
@@ -39,14 +46,26 @@ _DATA_TYPE_JSON_TYPE: dict[str, str | list[str]] = {
 
 
 def _value_schema(field_def: dict) -> dict:
+    # Gemini's response_json_schema is validated against a protobuf Schema whose
+    # `type` field holds exactly one value, not a repeating list (confirmed against
+    # the installed google-genai SDK's Schema type, which pairs a single `type` with
+    # a separate `nullable: bool`; live-verified 2026-09 - a schema.json-style
+    # `"type": [X, "null"]` union is rejected outright with HTTP 400 "Request
+    # contains an invalid argument", not accepted-but-ignored). A true multi-type
+    # union (integer_or_range, categorical_or_boolean) is expressed as `anyOf` with
+    # one single-type branch per alternative instead.
     data_type = field_def['data_type']
     base_types = _DATA_TYPE_JSON_TYPE[data_type]
     types = list(base_types) if isinstance(base_types, list) else [base_types]
-    value_schema: dict = {'type': types + ['null']}
 
     has_resolved_enum = field_def.get('allowed_values_status') == 'resolved_from_source' and field_def.get(
         'allowed_values'
     )
+
+    if len(types) > 1:
+        return {'anyOf': [{'type': t} for t in types] + [{'type': 'null'}]}
+
+    value_schema: dict = {'type': types[0], 'nullable': True}
 
     if data_type == 'multi_label_categorical':
         item_schema: dict = {'type': 'string'}
@@ -57,7 +76,8 @@ def _value_schema(field_def: dict) -> dict:
         # Only constrain with a closed enum where the eDAR spec actually defines one
         # (docs/open-decisions.md - most categorical fields don't yet; those stay
         # free-text below rather than a fabricated enum - source instructions §17).
-        value_schema['enum'] = list(field_def['allowed_values']) + [None]
+        # No explicit `None` member - `nullable: True` above already covers null.
+        value_schema['enum'] = list(field_def['allowed_values'])
 
     return value_schema
 
@@ -70,8 +90,8 @@ def _field_wrapper_schema(field_def: dict) -> dict:
         'type': 'object',
         'properties': {
             'value': _value_schema(field_def),
-            'confidence': {'type': ['number', 'null'], 'minimum': 0, 'maximum': 1},
-            'evidence': {'type': ['string', 'null']},
+            'confidence': {'type': 'number', 'nullable': True, 'minimum': 0, 'maximum': 1},
+            'evidence': {'type': 'string', 'nullable': True},
         },
         'required': ['value', 'confidence', 'evidence'],
         'propertyOrdering': ['value', 'confidence', 'evidence'],
@@ -99,11 +119,15 @@ def _repeating_item_schema(module: dict) -> dict:
     }
 
 
-def build_response_schema(edar_schema: dict) -> dict:
-    """The full Gemini `response_json_schema` for one extraction call - every Module
-    A(minus GPS)/B/C/F/G field as a top-level wrapped property, plus `vehicles`
-    (max 3, Module D) and `casualties` (max MAX_CASUALTIES, Module E) as arrays of
-    wrapped-field objects."""
+def build_flat_response_schema(edar_schema: dict) -> dict:
+    """Gemini `response_json_schema` for the first of three extraction calls - every
+    Module A(minus GPS)/B/C/F/G field as a top-level wrapped property. Split from
+    vehicles/casualties into its own call (docs/phase4-gemini-edar-extraction.md
+    §Structured-output strategy): the single combined schema this used to be is
+    rejected outright by Gemini (HTTP 400) once vehicles and casualties are added
+    alongside these 28 fields - verified empirically 2026-09 against the real API,
+    independent of any individual field or keyword. Three smaller schemas, one per
+    call, each comfortably under Gemini's complexity ceiling."""
     modules_by_id = {m['module_id']: m for m in edar_schema['modules']}
 
     properties: dict = {}
@@ -119,29 +143,46 @@ def build_response_schema(edar_schema: dict) -> dict:
             required.append(key)
             ordering.append(key)
 
-    vehicle_module = modules_by_id['D']
-    properties['vehicles'] = {
-        'type': 'array',
-        'maxItems': vehicle_module['max_repetitions'],
-        'items': _repeating_item_schema(vehicle_module),
-    }
-    required.append('vehicles')
-    ordering.append('vehicles')
-
-    casualty_module = modules_by_id['E']
-    properties['casualties'] = {
-        'type': 'array',
-        'maxItems': MAX_CASUALTIES,
-        'items': _repeating_item_schema(casualty_module),
-    }
-    required.append('casualties')
-    ordering.append('casualties')
-
     return {
         'type': 'object',
         'properties': properties,
         'required': required,
         'propertyOrdering': ordering,
+        'additionalProperties': False,
+    }
+
+
+def build_vehicles_response_schema(edar_schema: dict) -> dict:
+    """The second of three calls - a single `vehicles` key (max 3, Module D)."""
+    vehicle_module = next(m for m in edar_schema['modules'] if m['module_id'] == 'D')
+    vehicles_schema = {
+        'type': 'array',
+        'maxItems': vehicle_module['max_repetitions'],
+        'items': _repeating_item_schema(vehicle_module),
+    }
+    return {
+        'type': 'object',
+        'properties': {'vehicles': vehicles_schema},
+        'required': ['vehicles'],
+        'propertyOrdering': ['vehicles'],
+        'additionalProperties': False,
+    }
+
+
+def build_casualties_response_schema(edar_schema: dict) -> dict:
+    """The third of three calls - a single `casualties` key (max MAX_CASUALTIES, an
+    engineering safety bound - not a product/eDAR rule - Module E)."""
+    casualty_module = next(m for m in edar_schema['modules'] if m['module_id'] == 'E')
+    casualties_schema = {
+        'type': 'array',
+        'maxItems': MAX_CASUALTIES,
+        'items': _repeating_item_schema(casualty_module),
+    }
+    return {
+        'type': 'object',
+        'properties': {'casualties': casualties_schema},
+        'required': ['casualties'],
+        'propertyOrdering': ['casualties'],
         'additionalProperties': False,
     }
 

@@ -20,7 +20,7 @@ from csc_apps.activity_log.models import ActivityLog
 from csc_apps.processing import event_types
 from csc_apps.processing.error_classification import is_retryable
 from csc_apps.processing.models import ProcessingEvent, ProcessingJob
-from csc_apps.processing.providers.base import ProviderError, TranslationProvider
+from csc_apps.processing.providers.base import ProviderError, TranslationProvider, TranslationResult
 from csc_apps.processing.providers.sarvam.translation_provider import SarvamTranslationProvider
 from csc_apps.recordings.models.audio import Transcript
 
@@ -71,15 +71,29 @@ def run_translation_job(job_id: int, provider: TranslationProvider | None = None
         )
         return job
 
-    try:
-        result = provider.translate(
+    if original_transcript.detected_language_code == TARGET_LANGUAGE_CODE:
+        # Sarvam's translate API rejects a request where source == target
+        # ("Source and target languages must be different") - a statement Sarvam's
+        # STT already detected as English (en-IN) has nothing to translate, so the
+        # English transcript is the original transcript's text, verbatim, and the
+        # provider is never called for this job.
+        result = TranslationResult(
             text=original_transcript.text,
             source_language_code=original_transcript.detected_language_code,
             target_language_code=TARGET_LANGUAGE_CODE,
+            provider_name='identity',
+            provider_metadata={'chunk_count': 0, 'skipped_reason': 'source_already_target_language'},
         )
-    except ProviderError as e:
-        _record_failure(job, recording, e, duration_seconds=time.monotonic() - start)
-        return job
+    else:
+        try:
+            result = provider.translate(
+                text=original_transcript.text,
+                source_language_code=original_transcript.detected_language_code,
+                target_language_code=TARGET_LANGUAGE_CODE,
+            )
+        except ProviderError as e:
+            _record_failure(job, recording, e, duration_seconds=time.monotonic() - start)
+            return job
 
     _record_success(job, recording, result, duration_seconds=time.monotonic() - start)
     return job

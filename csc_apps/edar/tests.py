@@ -6,7 +6,9 @@ from csc_apps.edar.schema_validation import resolve_field_key, validate_extracti
 from csc_apps.processing.providers.gemini.schema_adapter import (
     GPS_FIELD_KEY,
     MAX_CASUALTIES,
-    build_response_schema,
+    build_casualties_response_schema,
+    build_flat_response_schema,
+    build_vehicles_response_schema,
     flat_field_keys,
     repeating_field_keys,
 )
@@ -257,36 +259,42 @@ class GeminiSchemaAdapterTests(SimpleTestCase):
         self.assertEqual(len(repeating_field_keys(schema, 'vehicle')), 7)
         self.assertEqual(len(repeating_field_keys(schema, 'casualty')), 6)
 
-    def test_response_schema_top_level_shape(self):
+    def test_flat_response_schema_top_level_shape(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_flat_response_schema(schema)
         self.assertEqual(response_schema['type'], 'object')
         for key in flat_field_keys(schema):
             self.assertIn(key, response_schema['properties'])
             self.assertIn(key, response_schema['required'])
-        self.assertIn('vehicles', response_schema['properties'])
-        self.assertIn('casualties', response_schema['properties'])
+        self.assertNotIn('vehicles', response_schema['properties'])
+        self.assertNotIn('casualties', response_schema['properties'])
 
-    def test_vehicles_array_capped_at_three(self):
+    def test_vehicles_response_schema_shape_and_cap(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_vehicles_response_schema(schema)
+        self.assertEqual(set(response_schema['properties']), {'vehicles'})
         self.assertEqual(response_schema['properties']['vehicles']['maxItems'], 3)
 
-    def test_casualties_array_capped_at_safety_bound(self):
+    def test_casualties_response_schema_shape_and_safety_bound(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_casualties_response_schema(schema)
+        self.assertEqual(set(response_schema['properties']), {'casualties'})
         self.assertEqual(response_schema['properties']['casualties']['maxItems'], MAX_CASUALTIES)
 
     def test_every_field_wrapper_has_value_confidence_evidence(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_flat_response_schema(schema)
         for key in flat_field_keys(schema):
             wrapper = response_schema['properties'][key]
             self.assertEqual(set(wrapper['properties']), {'value', 'confidence', 'evidence'})
+        vehicles_schema = build_vehicles_response_schema(schema)
+        vehicle_item = vehicles_schema['properties']['vehicles']['items']
+        for key in repeating_field_keys(schema, 'vehicle'):
+            self.assertEqual(set(vehicle_item['properties'][key]['properties']), {'value', 'confidence', 'evidence'})
 
     def test_resolved_enum_field_gets_enum_constraint(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_casualties_response_schema(schema)
         casualty_item = response_schema['properties']['casualties']['items']
         injury_value_schema = casualty_item['properties']['injury_severity']['properties']['value']
         self.assertIn('enum', injury_value_schema)
@@ -294,12 +302,75 @@ class GeminiSchemaAdapterTests(SimpleTestCase):
 
     def test_unresolved_categorical_field_has_no_enum_constraint(self):
         schema = load_schema()
-        response_schema = build_response_schema(schema)
+        response_schema = build_flat_response_schema(schema)
         road_type_value_schema = response_schema['properties']['road_type']['properties']['value']
         self.assertNotIn('enum', road_type_value_schema)
 
-    def test_schema_is_json_serializable(self):
+    def test_no_schema_uses_a_type_array_anywhere(self):
+        # Gemini's response_json_schema is checked against a protobuf Schema whose
+        # `type` field holds exactly one value - a JSON-Schema-style `"type": [X,
+        # "null"]` union is rejected outright (live-verified 2026-09). Nullability
+        # must be expressed as `nullable: true` alongside a single `type`, or as
+        # `anyOf` for a true multi-type union.
         import json
 
+        def assert_no_type_array(node):
+            if isinstance(node, dict):
+                self.assertNotIsInstance(node.get('type'), list)
+                for value in node.values():
+                    assert_no_type_array(value)
+            elif isinstance(node, list):
+                for value in node:
+                    assert_no_type_array(value)
+
         schema = load_schema()
-        json.dumps(build_response_schema(schema))  # must not raise
+        for builder in (build_flat_response_schema, build_vehicles_response_schema, build_casualties_response_schema):
+            response_schema = builder(schema)
+            assert_no_type_array(response_schema)
+            json.dumps(response_schema)  # must not raise
+
+
+class GeminiPromptModuleScopingTests(SimpleTestCase):
+    """docs/phase4-gemini-edar-extraction.md §Structured-output strategy - each of
+    the three extraction calls' prompts must reference only its own module's
+    fields, matching that call's own response schema (a prompt asking about a field
+    a call's schema has no slot for would be pure noise at best, misleading at
+    worst)."""
+
+    def test_flat_prompt_excludes_vehicle_and_casualty_fields(self):
+        from csc_apps.processing.providers.gemini.prompt import build_flat_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_flat_extraction_prompt('a transcript', schema)
+        for key in repeating_field_keys(schema, 'vehicle') + repeating_field_keys(schema, 'casualty'):
+            self.assertNotIn(f'- {key} (', prompt)
+
+    def test_vehicle_prompt_excludes_flat_and_casualty_fields(self):
+        from csc_apps.processing.providers.gemini.prompt import build_vehicles_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_vehicles_extraction_prompt('a transcript', schema)
+        for key in flat_field_keys(schema) + repeating_field_keys(schema, 'casualty'):
+            self.assertNotIn(f'- {key} (', prompt)
+        self.assertIn('vehicle_type', prompt)
+
+    def test_casualty_prompt_excludes_flat_and_vehicle_fields(self):
+        from csc_apps.processing.providers.gemini.prompt import build_casualties_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_casualties_extraction_prompt('a transcript', schema)
+        for key in flat_field_keys(schema) + repeating_field_keys(schema, 'vehicle'):
+            self.assertNotIn(f'- {key} (', prompt)
+        self.assertIn('injury_severity', prompt)
+
+    def test_all_three_prompts_include_the_transcript_verbatim(self):
+        from csc_apps.processing.providers.gemini.prompt import (
+            build_casualties_extraction_prompt,
+            build_flat_extraction_prompt,
+            build_vehicles_extraction_prompt,
+        )
+
+        schema = load_schema()
+        transcript = 'the motorcycle hit the rear of the car, verbatim marker XYZ123'
+        for builder in (build_flat_extraction_prompt, build_vehicles_extraction_prompt, build_casualties_extraction_prompt):
+            self.assertIn(transcript, builder(transcript, schema))
