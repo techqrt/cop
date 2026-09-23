@@ -235,3 +235,169 @@ being read as "correct" or "approved".
 quality output as reviewer guidance only.
 
 **Status:** Accepted.
+
+---
+
+### ADR-020 — Officer approval creates a separate, immutable APPROVED layer; it never overwrites AI output
+
+**Context:** Phase 6 adds the human review/approval workflow the AI eDAR candidate
+(Phase 4/5) was always meant to feed into. The existing `EdarFieldValue.layer`
+(`AI`/`APPROVED`, ADR-008/ADR-011) and `EdarRecord.review_status`/`reviewed_by`/
+`reviewed_at` were designed for this from Phase 0 but never written to.
+
+**Decision:**
+1. **Approval only ever creates `layer=APPROVED` rows.** It never updates,
+   deletes, or re-tags a `layer=AI` row - verified by a dedicated test comparing
+   every AI column before and after an approval that includes edits.
+2. **The APPROVED snapshot is always complete, never a diff on disk.** The
+   officer's request body is a partial edit set (only changed fields); the server
+   builds the full snapshot by copying every other field from the current AI
+   candidate. A field_key the AI candidate has no row for cannot be
+   approved-into - editing is scoped to confirming/correcting what Gemini
+   produced, not adding new vehicle/casualty records (a larger, deliberately
+   deferred feature).
+3. **Officer input is validated by the same schema engine AI output is**
+   (`csc_apps.edar.schema_validation`), not a second validation system - extended
+   with one new entry point (`validate_approved_value`) rather than duplicated.
+4. **One APPROVED snapshot per EdarRecord.** A second approval attempt is
+   rejected outright (no versioning/history added) - the smallest safe behavior
+   given the existing `unique_together (edar_record, field_key, layer)`
+   constraint.
+5. **The whole write is one atomic transaction**: validation, the APPROVED
+   snapshot, `review_status`, the Recording state-machine advance to
+   `COMPLETED`, and the ActivityLog audit entry either all succeed or none do.
+6. **No second audit system.** Field-level change tracking
+   (field/AI value/approved value/officer/timestamp) lives in the existing
+   `ActivityLog.details` JSON, not a new model.
+
+**Consequences:** No approval history is kept - only the single current APPROVED
+snapshot. Re-approval requires a product decision (versioning?) this phase
+deliberately does not make.
+
+**Status:** Accepted.
+
+---
+
+### ADR-021 — History/search is a read layer over the existing domain model, scoped narrower than detail-endpoint access
+
+**Context:** Phase 7 adds recording history/search. No history table or second
+domain entity was introduced - `Recording`, `ProcessingJob`, and `EdarRecord`
+already carry everything a concise history row needs.
+
+**Decision:**
+1. **No new table.** `GET /recordings/` queries `Recording` directly, batches
+   `ProcessingJob` and `EdarRecord` lookups per page (never per row), and returns a
+   concise projection - never transcript text, eDAR fields, quality reports, or
+   audit details, which remain `GET /recordings/<id>/`'s job.
+2. **Every role is scoped to recordings they personally own in the list -
+   deliberately narrower than `GET /recordings/<id>/`'s owner-OR-REVIEWER/ADMIN
+   rule.** Confirmed as a product decision (not inferred): a REVIEWER/ADMIN can
+   still open any recording directly by ID (unchanged), but the list only ever
+   shows their own. Authorization is applied at the query level
+   (`Recording.objects.filter(officer=requesting_user)`) before any filter or
+   pagination - a filter can only narrow the requester's own accessible set.
+3. **`road_name`/`case_fir_number`/`police_station_jurisdiction` search uses
+   `Recording`'s own Phase 1 officer-confirmed columns, not an eDAR AI/APPROVED
+   value.** No layer ambiguity to resolve for these fields; `reviewStatus` (from
+   `EdarRecord`) is the one eDAR-derived field in the list, and it is a single
+   unambiguous per-record status, never a per-field AI/APPROVED pair.
+4. **`GET /recordings/` and `POST /recordings/` share one URL path** (per source
+   instructions), via a small combined dispatcher that exists only so drf-
+   spectacular can document both operations - each remains an independent,
+   separately-decorated view underneath.
+5. **No crash-date filtering, no transcript full-text search, no generic
+   `field_key=value` eDAR search, no configurable sort field.** Each deliberately
+   deferred, not overlooked - documented in `docs/phase7-history-search.md`.
+
+**Consequences:** A REVIEWER wanting to review another officer's recording still
+needs the ID communicated out-of-band - no "recordings pending my review" view
+exists (OD-001 remains open).
+
+**Status:** Accepted.
+
+---
+
+### ADR-022 — Export reads only the APPROVED layer, in a module-grouped shape distinct from the API's flat field map
+
+**Context:** Phase 8 adds a JSON export of the officer-approved eDAR dataset,
+downstream of Phase 6 approval. The risk mirrors Phase 6's own: an export that
+silently substitutes AI data for missing approved data would let an unapproved or
+AI-only value appear as though it were officer-approved.
+
+**Decision:**
+1. **Export reads `layer='APPROVED'` only - `csc_apps.edar.export_service`
+   contains no query against `layer='AI'` at all.** Missing/incomplete approved
+   data fails the export; it is never filled from the AI candidate. Verified by a
+   test that mutates an AI row's value after approval and confirms it cannot
+   appear in the export.
+2. **The export groups fields by the 7 eDAR modules, with vehicles/casualties as
+   arrays** - a different shape from `GET /recordings/<id>/`'s flat dotted-key
+   map (`edar.fields`/`edar.approved.fields`), chosen for a standalone downstream
+   document rather than reusing the live API's internal representation verbatim.
+3. **`gps_coordinates` is read from `Recording` directly, not the eDAR layer
+   system**, since it never had an AI or APPROVED `EdarFieldValue` row to begin
+   with (ADR-012) - not an exception to rule 1, since GPS was never part of that
+   layer distinction.
+4. **A normal `{status, message, data}` API response, not a downloadable file
+   attachment.** No `Content-Disposition`/file-download precedent exists anywhere
+   in PMS to diverge from.
+5. **No new audit mechanism.** Export access logging is deferred to Phase 9 -
+   `ActivityLog.ACTION_CHOICES` has no fitting verb, and adding one would force a
+   migration this phase deliberately avoids.
+
+**Consequences:** A downstream consumer of the export gets a self-contained,
+module-grouped document rather than the API's internal flat shape - two
+representations of the same approved data now exist (list/detail's flat map,
+export's nested module structure), both always sourced from the same
+`layer='APPROVED'` rows.
+
+**Status:** Accepted.
+
+---
+
+### ADR-023 — Phase 9 hardening reuses ActivityLog and fails fast on an insecure SECRET_KEY, rather than adding new security infrastructure
+
+**Context:** Phase 9 audited authentication, authorization, audit coverage, logging,
+and configuration across Phases 0-8. No architectural defect was found requiring a
+redesign; two concrete gaps were: (1) login and eDAR export were not audited
+(Phase 8 explicitly deferred export auditing), and (2) `SECRET_KEY` silently falls
+back to a value committed in this repository, which would forge-any-JWT if ever
+run with `DEBUG=False` and no real key configured — observed as a live risk, not
+hypothetical (the server used for this project's own smoke testing was found
+running with `DEBUG=True`).
+
+**Decision:**
+1. **`ActivityLog.ACTION_CHOICES` gains one new value, `'Read'`** — the generic
+   fourth CRUD verb, covering both login and export rather than one bespoke action
+   name per event type. `details['event']` disambiguates which. One migration
+   (`activity_log.0003_alter_activitylog_action`) — justified per source
+   instructions §33 ("do not avoid a legitimate security/audit requirement merely
+   to avoid a migration"), still no new table.
+2. **Login (`AuthView.login_extract`) and export
+   (`RecordingView.export_edar_extract`) now call `ActivityLog.record(...)`** on
+   success only — no failed-login-attempt tracking was added (a deliberate scope
+   boundary: that edges toward intrusion-detection infrastructure the source
+   instructions explicitly warn against building in Phase 9). Neither entry stores
+   the token/password or the exported eDAR payload.
+3. **`csc/settings.py` raises `ImproperlyConfigured` at startup if `DEBUG=False`
+   and `SECRET_KEY` is still the committed insecure default** — fails loudly
+   instead of silently signing every JWT with a publicly-known key. The default
+   itself is kept for local/dev convenience under `DEBUG=True`.
+4. **Three security settings safe under any deployment topology were set
+   explicitly** (`SECURE_CONTENT_TYPE_NOSNIFF`, `SECURE_REFERRER_POLICY`,
+   `X_FRAME_OPTIONS`). TLS-dependent settings
+   (`SECURE_SSL_REDIRECT`/`SESSION_COOKIE_SECURE`/`CSRF_COOKIE_SECURE`/HSTS) were
+   deliberately left unset — forcing them without knowing the actual TLS
+   termination topology would break local/test HTTP access; documented as a
+   required Phase 10 deployment decision instead.
+5. **`docs/security-baseline.md`'s original Phase 0 authorization claim (only
+   REVIEWER/ADMIN write APPROVED) was corrected**, not the code — Phase 6 already
+   made a different, deliberate, confirmed decision (owner OR REVIEWER/ADMIN); the
+   doc had simply never been updated when Phase 6 shipped.
+
+**Consequences:** `ActivityLog` remains the single audit mechanism (no
+`SecurityEvent`/`LoginHistory`/`ExportHistory` table). Deployment-dependent
+settings (TLS, `ALLOWED_HOSTS`, CORS) remain explicitly deferred to Phase 10, not
+silently assumed solved.
+
+**Status:** Accepted.

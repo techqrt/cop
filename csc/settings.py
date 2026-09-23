@@ -11,13 +11,30 @@ import os
 
 from decouple import config
 
+from django.core.exceptions import ImproperlyConfigured
+
 from csc.config import Configurations
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = config('SECRET_KEY', default='csc-insecure-dev-key-change-in-production')
+_INSECURE_DEFAULT_SECRET_KEY = 'csc-insecure-dev-key-change-in-production'
+SECRET_KEY = config('SECRET_KEY', default=_INSECURE_DEFAULT_SECRET_KEY)
 
 DEBUG = Configurations.debug
+
+# Phase 9 (docs/phase9-security-audit-observability.md §Configuration security) - the
+# dev-convenience default above signs every JWT (csc_apps.authentication.
+# authentication.JWTAuthentication) with a value published in this repository. With
+# DEBUG=True that's an accepted local/test tradeoff; with DEBUG=False it would let
+# anyone forge a valid session token for any user. Fail fast at startup rather than
+# silently running insecure - this was found, not hypothetical: the server used for
+# this project's own live smoke testing was observed running with DEBUG=True
+# (docs/phase9-security-audit-observability.md §Remaining risks).
+if not DEBUG and SECRET_KEY == _INSECURE_DEFAULT_SECRET_KEY:
+    raise ImproperlyConfigured(
+        'SECRET_KEY is not set (or still the insecure default) while DEBUG=False. '
+        'Set a real SECRET_KEY in the environment before running with DEBUG off.'
+    )
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*').split(',')
 
@@ -163,3 +180,17 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'Authentication and audio ingestion (Phase 0/1). See docs/api-architecture.md.',
     'VERSION': '0.2.0',
 }
+
+# Phase 9 (docs/phase9-security-audit-observability.md §Configuration security) -
+# only settings safe to enable unconditionally, regardless of deployment/TLS
+# topology (nothing here can break local dev or a plain-HTTP test environment).
+# X_FRAME_OPTIONS is Django's own default ('DENY') as of Django 3.0 - set
+# explicitly so it's a documented decision, not an implicit default someone could
+# accidentally lower and not notice. SECURE_SSL_REDIRECT, SESSION_COOKIE_SECURE,
+# CSRF_COOKIE_SECURE, and HSTS are deliberately NOT set here - they assume TLS is
+# terminated somewhere in front of this app, which is a Phase 10 deployment
+# decision this settings file cannot safely make on its own (docs/phase9-security-
+# audit-observability.md §Deployment-dependent requirements).
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = 'same-origin'
+X_FRAME_OPTIONS = 'DENY'

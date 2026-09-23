@@ -6,12 +6,15 @@ from unittest.mock import patch
 
 from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from csc_apps.activity_log.models import ActivityLog
 from csc_apps.authentication.models import User
+from csc_apps.edar import approval_service
 from csc_apps.edar.models import EdarFieldValue, EdarRecord
 from csc_apps.processing import event_types
 from csc_apps.processing.models import ProcessingEvent, ProcessingJob
@@ -780,3 +783,906 @@ class RecordingDetailExtractionAPITests(TestCase):
         self._get(self.owner)
         self.assertFalse(ProcessingJob.objects.filter(recording=self.recording, job_type='EXTRACTION').exists())
         self.assertFalse(EdarRecord.objects.filter(recording=self.recording).exists())
+
+
+class RecordingEdarApprovalAPITests(TestCase):
+    """POST /recordings/<id>/edar/approve/ - Phase 6 officer review + approval
+    (docs/phase6-officer-review-approval.md §Testing). Reuses the exact
+    authorization scenarios Phase 2-5 established for this same recording
+    resource - approval is a write on the same resource GET already authorizes."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            email='owner6@example.com', password='pw', name='Owner Officer', role='OFFICER'
+        )
+        self.other_officer = User.objects.create_user(
+            email='other6@example.com', password='pw', name='Other Officer', role='OFFICER'
+        )
+        self.reviewer = User.objects.create_user(
+            email='reviewer6@example.com', password='pw', name='Reviewer One', role='REVIEWER'
+        )
+        self.admin = User.objects.create_user(
+            email='admin6@example.com', password='pw', name='Admin One', role='ADMIN'
+        )
+        self.recording = Recording.objects.create(officer=self.owner, status='READY_FOR_REVIEW')
+
+    def _client_as(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def _get(self, user):
+        return self._client_as(user).get(f'/recordings/{self.recording.recording_id}/')
+
+    def _approve(self, user=None, fields=None):
+        client = self._client_as(user) if user else APIClient()
+        return client.post(
+            f'/recordings/{self.recording.recording_id}/edar/approve/', {'fields': fields or {}}, format='json'
+        )
+
+    def _make_ai_candidate(self):
+        ProcessingJob.objects.create(recording=self.recording, job_type='EXTRACTION', status='SUCCEEDED')
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='road_name', layer='AI', known='KNOWN',
+            value='NH 48', confidence=0.91, source_transcript_segment='The crash occurred on NH 48.',
+            extraction_version='gemini-3.8-flash/prompt-v2/schema-0.1.0',
+        )
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='weather_at_time_of_crash', layer='AI', known='UNKNOWN',
+            extraction_version='gemini-3.8-flash/prompt-v2/schema-0.1.0',
+        )
+        return edar_record
+
+    def test_unauthenticated_request_is_rejected(self):
+        self._make_ai_candidate()
+        self.assertEqual(self._approve().status_code, 401)
+
+    def test_owner_can_approve(self):
+        self._make_ai_candidate()
+        response = self._approve(self.owner)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data['status'])
+
+    def test_reviewer_can_approve(self):
+        self._make_ai_candidate()
+        response = self._approve(self.reviewer)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_admin_can_approve(self):
+        self._make_ai_candidate()
+        response = self._approve(self.admin)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_other_officer_cannot_approve(self):
+        self._make_ai_candidate()
+        response = self._approve(self.other_officer)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.data['status'])
+        self.assertFalse(EdarFieldValue.objects.filter(layer='APPROVED').exists())
+
+    def test_no_ai_candidate_rejected(self):
+        response = self._approve(self.owner)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(EdarFieldValue.objects.filter(layer='APPROVED').exists())
+
+    def test_already_approved_rejected_no_duplicate(self):
+        self._make_ai_candidate()
+        first = self._approve(self.owner)
+        self.assertEqual(first.status_code, 200)
+        second = self._approve(self.owner, fields={'road_name': {'known': 'KNOWN', 'value': 'Somewhere else'}})
+        self.assertEqual(second.status_code, 400)
+        approved = EdarFieldValue.objects.filter(layer='APPROVED', field_key='road_name')
+        self.assertEqual(approved.count(), 1)
+        self.assertEqual(approved.first().value, 'NH 48')
+
+    def test_invalid_value_rejected_no_approved_rows_created(self):
+        self._make_ai_candidate()
+        response = self._approve(self.owner, fields={'road_name': {'known': 'KNOWN', 'value': 123}})
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(EdarFieldValue.objects.filter(layer='APPROVED').exists())
+
+    def test_get_before_approval_shows_pending_review_and_null_approved(self):
+        self._make_ai_candidate()
+        response = self._get(self.owner)
+        edar = response.data['data']['edar']
+        self.assertEqual(edar['reviewStatus'], 'PENDING_REVIEW')
+        self.assertIsNone(edar['approved'])
+        self.assertEqual(edar['fields']['road_name']['value'], 'NH 48')
+
+    def test_get_after_approval_shows_approved_alongside_unchanged_ai(self):
+        self._make_ai_candidate()
+        self._approve(self.owner, fields={'road_name': {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'}})
+        response = self._get(self.owner)
+        edar = response.data['data']['edar']
+        self.assertEqual(edar['reviewStatus'], 'APPROVED')
+        self.assertEqual(edar['layer'], 'AI')
+        # AI view is untouched.
+        self.assertEqual(edar['fields']['road_name']['value'], 'NH 48')
+        self.assertEqual(edar['fields']['road_name']['confidence'], 0.91)
+        # APPROVED view reflects the officer's edit.
+        self.assertEqual(edar['approved']['fields']['road_name']['value'], 'NH 48, Ahmedabad')
+        self.assertEqual(edar['approved']['reviewedBy']['userId'], self.owner.user_id)
+        self.assertIsNotNone(edar['approved']['reviewedAt'])
+
+    def test_multiple_field_edits_via_http(self):
+        self._make_ai_candidate()
+        response = self._approve(self.owner, fields={
+            'road_name': {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'},
+            'weather_at_time_of_crash': {'known': 'KNOWN', 'value': 'clear'},
+        })
+        self.assertEqual(response.status_code, 200, response.data)
+        approved_fields = response.data['data']['edar']['approved']['fields']
+        self.assertEqual(approved_fields['road_name']['value'], 'NH 48, Ahmedabad')
+        self.assertEqual(approved_fields['weather_at_time_of_crash'], {'value': 'clear', 'known': 'KNOWN'})
+
+    def test_response_follows_pms_envelope(self):
+        self._make_ai_candidate()
+        response = self._approve(self.owner)
+        self.assertEqual(set(response.data.keys()), {'status', 'message', 'data'})
+
+    def test_no_provider_internals_or_secrets_in_response(self):
+        self._make_ai_candidate()
+        response = self._approve(self.owner, fields={'road_name': {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'}})
+        rendered = str(response.data)
+        for forbidden in ('request_id', 'api_key', 'GEMINI', 'Traceback', 'SARVAM'):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_approval_does_not_mutate_ai_rows(self):
+        edar_record = self._make_ai_candidate()
+        before = {
+            r.field_value_id: (r.known, r.value, r.confidence, r.source_transcript_segment, r.extraction_version)
+            for r in EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI')
+        }
+        self._approve(self.owner, fields={'road_name': {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'}})
+        after = {
+            r.field_value_id: (r.known, r.value, r.confidence, r.source_transcript_segment, r.extraction_version)
+            for r in EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI')
+        }
+        self.assertEqual(before, after)
+
+    def test_recording_advances_to_completed_after_approval(self):
+        self._make_ai_candidate()
+        self._approve(self.owner)
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.status, 'COMPLETED')
+
+    def test_client_cannot_set_approving_user_or_layer_via_body(self):
+        # The request serializer has no reviewedBy/approvedBy/layer field at all -
+        # any such key in the body is simply ignored, never trusted.
+        self._make_ai_candidate()
+        client = self._client_as(self.owner)
+        response = client.post(
+            f'/recordings/{self.recording.recording_id}/edar/approve/',
+            {'fields': {}, 'reviewedBy': 999, 'layer': 'APPROVED', 'approvedBy': 999},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['data']['edar']['approved']['reviewedBy']['userId'], self.owner.user_id)
+
+
+class RecordingListAPITests(TestCase):
+    """GET /recordings/ - Phase 7 history/search (docs/phase7-history-search.md).
+    Shares its URL with POST /recordings/ (Phase 1 upload); dispatch itself is
+    covered by test_get_and_post_share_one_path below."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            email='owner7@example.com', password='pw', name='Owner Officer', role='OFFICER'
+        )
+        self.other_officer = User.objects.create_user(
+            email='other7@example.com', password='pw', name='Other Officer', role='OFFICER'
+        )
+        self.reviewer = User.objects.create_user(
+            email='reviewer7@example.com', password='pw', name='Reviewer One', role='REVIEWER'
+        )
+        self.admin = User.objects.create_user(
+            email='admin7@example.com', password='pw', name='Admin One', role='ADMIN'
+        )
+
+    def _client_as(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def _list(self, user=None, **query):
+        client = self._client_as(user) if user else APIClient()
+        return client.get('/recordings/', query)
+
+    def _make_recording(
+        self, officer, status='PROCESSING', road_name=None, case_fir_number=None,
+        stt='SUCCEEDED', translation=None, extraction=None, review_status=None,
+    ):
+        recording = Recording.objects.create(
+            officer=officer, status=status, road_name=road_name, case_fir_number=case_fir_number,
+        )
+        if stt:
+            ProcessingJob.objects.create(recording=recording, job_type='STT', status=stt)
+        if translation:
+            ProcessingJob.objects.create(recording=recording, job_type='TRANSLATION', status=translation)
+        if extraction:
+            ProcessingJob.objects.create(recording=recording, job_type='EXTRACTION', status=extraction)
+        if review_status:
+            EdarRecord.objects.create(recording=recording, review_status=review_status)
+        return recording
+
+    # --- Basic history ---------------------------------------------------
+
+    def test_unauthenticated_request_is_rejected(self):
+        self.assertEqual(self._list().status_code, 401)
+
+    def test_authenticated_history_request_returns_own_recordings(self):
+        self._make_recording(self.owner)
+        response = self._list(self.owner)
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(len(response.data['data']['data']), 1)
+
+    def test_empty_history_returns_200_with_empty_list_not_404(self):
+        response = self._list(self.owner)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['data']['data'], [])
+        self.assertTrue(response.data['status'])
+
+    def test_deterministic_ordering_newest_first(self):
+        first = self._make_recording(self.owner)
+        second = self._make_recording(self.owner)
+        response = self._list(self.owner)
+        ids = [row['recordingId'] for row in response.data['data']['data']]
+        self.assertEqual(ids, [second.recording_id, first.recording_id])
+
+    def test_pagination_first_and_subsequent_page(self):
+        for _ in range(3):
+            self._make_recording(self.owner)
+        first_page = self._list(self.owner, limit=2, page_num=1)
+        self.assertEqual(len(first_page.data['data']['data']), 2)
+        self.assertEqual(first_page.data['data']['presentPage'], 1)
+        self.assertEqual(first_page.data['data']['totalPage'], 2)
+        self.assertIn('nextPageUrl', first_page.data['data'])
+
+        second_page = self._list(self.owner, limit=2, page_num=2)
+        self.assertEqual(len(second_page.data['data']['data']), 1)
+        self.assertEqual(second_page.data['data']['presentPage'], 2)
+        first_ids = {row['recordingId'] for row in first_page.data['data']['data']}
+        second_ids = {row['recordingId'] for row in second_page.data['data']['data']}
+        self.assertEqual(first_ids & second_ids, set())
+
+    def test_page_size_respects_limit(self):
+        for _ in range(5):
+            self._make_recording(self.owner)
+        response = self._list(self.owner, limit=3)
+        self.assertEqual(len(response.data['data']['data']), 3)
+
+    # --- Authorization / IDOR --------------------------------------------
+
+    def test_owner_sees_own_recording(self):
+        recording = self._make_recording(self.owner)
+        response = self._list(self.owner)
+        self.assertIn(recording.recording_id, [r['recordingId'] for r in response.data['data']['data']])
+
+    def test_other_officer_cannot_see_owners_recording(self):
+        self._make_recording(self.owner)
+        response = self._list(self.other_officer)
+        self.assertEqual(response.data['data']['data'], [])
+
+    def test_reviewer_sees_only_their_own_recordings_not_everyone_elses(self):
+        # Deliberate Phase 7 scope decision (docs/phase7-history-search.md
+        # §Authorization): narrower than GET/<id>/'s owner-OR-REVIEWER/ADMIN rule.
+        self._make_recording(self.owner)
+        own = self._make_recording(self.reviewer)
+        response = self._list(self.reviewer)
+        ids = [r['recordingId'] for r in response.data['data']['data']]
+        self.assertEqual(ids, [own.recording_id])
+
+    def test_admin_sees_only_their_own_recordings(self):
+        self._make_recording(self.owner)
+        own = self._make_recording(self.admin)
+        response = self._list(self.admin)
+        ids = [r['recordingId'] for r in response.data['data']['data']]
+        self.assertEqual(ids, [own.recording_id])
+
+    def test_reviewer_can_still_open_hidden_recording_directly_by_id(self):
+        # Unchanged Phase 2-6 behavior on the existing detail endpoint - only the
+        # LIST is scoped narrower in Phase 7, not GET/<id>/ itself.
+        recording = self._make_recording(self.owner)
+        client = self._client_as(self.reviewer)
+        response = client.get(f'/recordings/{recording.recording_id}/')
+        self.assertEqual(response.status_code, 200)
+
+    def test_filter_cannot_reveal_another_officers_recording(self):
+        self._make_recording(self.owner, road_name='NH 48', case_fir_number='FIR-0099')
+        response = self._list(self.other_officer, road_name='NH', case_fir_number='FIR-0099')
+        self.assertEqual(response.data['data']['data'], [])
+
+    def test_idor_search_by_exact_case_fir_number_does_not_leak_across_officers(self):
+        self._make_recording(self.owner, case_fir_number='FIR-SECRET-1')
+        response = self._list(self.other_officer, case_fir_number='FIR-SECRET-1')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['data']['data'], [])
+
+    def test_authorization_filter_applied_at_query_level_not_python_post_filter(self):
+        # If authorization were applied after fetching (Python-side), a page_num/
+        # limit combination could still be used to enumerate rows before they are
+        # discarded. Assert the other officer's own empty result set has
+        # totalPage/presentPage consistent with zero *accessible* rows, not with
+        # the other officer's one existing (but inaccessible) recording.
+        self._make_recording(self.owner)
+        response = self._list(self.other_officer)
+        self.assertEqual(response.data['data']['totalPage'], 1)
+        self.assertEqual(response.data['data']['data'], [])
+
+    # --- Search / filtering ------------------------------------------------
+
+    def test_filter_by_status(self):
+        self._make_recording(self.owner, status='COMPLETED')
+        self._make_recording(self.owner, status='PROCESSING')
+        response = self._list(self.owner, status='COMPLETED')
+        rows = response.data['data']['data']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 'COMPLETED')
+
+    def test_filter_by_review_status(self):
+        self._make_recording(self.owner, review_status='APPROVED')
+        self._make_recording(self.owner, review_status='PENDING_REVIEW')
+        self._make_recording(self.owner)  # no EdarRecord at all
+        response = self._list(self.owner, review_status='APPROVED')
+        rows = response.data['data']['data']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['reviewStatus'], 'APPROVED')
+
+    def test_filter_by_case_fir_number_is_exact_match(self):
+        self._make_recording(self.owner, case_fir_number='FIR-2026-001')
+        self._make_recording(self.owner, case_fir_number='FIR-2026-0011')
+        response = self._list(self.owner, case_fir_number='FIR-2026-001')
+        rows = response.data['data']['data']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['caseFirNumber'], 'FIR-2026-001')
+
+    def test_filter_by_road_name_is_partial_case_insensitive_match(self):
+        self._make_recording(self.owner, road_name='National Highway 48, near Vadodara')
+        self._make_recording(self.owner, road_name='SH 12')
+        response = self._list(self.owner, road_name='highway 48')
+        rows = response.data['data']['data']
+        self.assertEqual(len(rows), 1)
+        self.assertIn('National Highway 48', rows[0]['roadName'])
+
+    def test_filter_by_created_date_range(self):
+        old = self._make_recording(self.owner)
+        Recording.objects.filter(pk=old.pk).update(created_at='2020-01-01T00:00:00Z')
+        recent = self._make_recording(self.owner)
+        response = self._list(self.owner, created_from='2025-01-01')
+        ids = [r['recordingId'] for r in response.data['data']['data']]
+        self.assertEqual(ids, [recent.recording_id])
+
+    def test_multiple_filters_combine_with_and_not_or(self):
+        self._make_recording(self.owner, status='COMPLETED', road_name='NH 48')
+        self._make_recording(self.owner, status='PROCESSING', road_name='NH 48')
+        self._make_recording(self.owner, status='COMPLETED', road_name='SH 12')
+        response = self._list(self.owner, status='COMPLETED', road_name='NH 48')
+        self.assertEqual(len(response.data['data']['data']), 1)
+
+    def test_no_match_search_returns_empty_not_error(self):
+        self._make_recording(self.owner, road_name='NH 48')
+        response = self._list(self.owner, road_name='does-not-exist-anywhere')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['data']['data'], [])
+
+    def test_invalid_status_filter_is_rejected(self):
+        response = self._list(self.owner, status='NOT_A_REAL_STATUS')
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_date_filter_is_rejected(self):
+        response = self._list(self.owner, created_from='not-a-date')
+        self.assertEqual(response.status_code, 400)
+
+    def test_invalid_page_num_is_rejected(self):
+        self._make_recording(self.owner)
+        response = self._list(self.owner, page_num=999)
+        self.assertEqual(response.status_code, 400)
+
+    def test_limit_above_maximum_is_rejected(self):
+        response = self._list(self.owner, limit=10000)
+        self.assertEqual(response.status_code, 400)
+
+    # --- Layer semantics -----------------------------------------------
+
+    def test_approved_record_shows_approved_review_status(self):
+        self._make_recording(self.owner, review_status='APPROVED')
+        response = self._list(self.owner)
+        self.assertEqual(response.data['data']['data'][0]['reviewStatus'], 'APPROVED')
+
+    def test_pending_record_shows_pending_review_status_not_approved(self):
+        self._make_recording(self.owner, review_status='PENDING_REVIEW')
+        response = self._list(self.owner)
+        self.assertEqual(response.data['data']['data'][0]['reviewStatus'], 'PENDING_REVIEW')
+
+    def test_no_edar_record_yet_shows_null_review_status_not_fabricated(self):
+        self._make_recording(self.owner)
+        response = self._list(self.owner)
+        self.assertIsNone(response.data['data']['data'][0]['reviewStatus'])
+
+    def test_list_never_exposes_raw_edar_field_values(self):
+        recording = self._make_recording(self.owner, review_status='APPROVED')
+        edar_record = EdarRecord.objects.get(recording=recording)
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='crash_type', layer='AI', known='KNOWN',
+            value='SECRET-AI-VALUE', confidence=0.9, extraction_version='v',
+        )
+        response = self._list(self.owner)
+        self.assertNotIn('SECRET-AI-VALUE', str(response.data))
+        self.assertNotIn('fields', response.data['data']['data'][0])
+
+    # --- API shape --------------------------------------------------------
+
+    def test_response_follows_pms_envelope(self):
+        response = self._list(self.owner)
+        self.assertEqual(set(response.data.keys()), {'status', 'message', 'data'})
+
+    def test_pagination_metadata_shape(self):
+        self._make_recording(self.owner)
+        response = self._list(self.owner)
+        self.assertEqual(set(response.data['data'].keys()) - {'nextPageUrl', 'previousPageUrl'}, {'data', 'presentPage', 'totalPage'})
+
+    def test_list_item_shape_is_concise(self):
+        self._make_recording(self.owner, road_name='NH 48', case_fir_number='FIR-1', review_status='APPROVED')
+        row = self._list(self.owner).data['data']['data'][0]
+        self.assertEqual(set(row.keys()), {
+            'recordingId', 'status', 'createdAt', 'roadName', 'caseFirNumber',
+            'policeStationJurisdiction', 'processingStatus', 'translationStatus',
+            'extractionStatus', 'reviewStatus',
+        })
+
+    def test_get_and_post_share_one_path(self):
+        response = self._client_as(self.owner).put('/recordings/')
+        self.assertEqual(response.status_code, 405)
+
+    # --- Performance / query behavior --------------------------------------
+
+    def test_list_query_count_does_not_scale_with_recording_count(self):
+        for _ in range(2):
+            self._make_recording(self.owner, translation='SUCCEEDED', extraction='SUCCEEDED', review_status='APPROVED')
+        with CaptureQueriesContext(connection) as small:
+            self._list(self.owner, limit=10)
+        for _ in range(8):
+            self._make_recording(self.owner, translation='SUCCEEDED', extraction='SUCCEEDED', review_status='APPROVED')
+        with CaptureQueriesContext(connection) as large:
+            self._list(self.owner, limit=10)
+        self.assertEqual(len(small.captured_queries), len(large.captured_queries))
+
+    def test_list_does_not_issue_one_query_per_recording(self):
+        for _ in range(6):
+            self._make_recording(self.owner, translation='SUCCEEDED', extraction='SUCCEEDED', review_status='APPROVED')
+        with CaptureQueriesContext(connection) as ctx:
+            response = self._list(self.owner, limit=10)
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(len(ctx.captured_queries), 10)
+
+    # --- Security -----------------------------------------------------
+
+    def test_no_secrets_or_internals_in_list_response(self):
+        self._make_recording(self.owner)
+        response = self._list(self.owner)
+        rendered = str(response.data)
+        for forbidden in ('request_id', 'api_key', 'GEMINI', 'SARVAM', 'Traceback', 'Bearer'):
+            self.assertNotIn(forbidden, rendered)
+
+
+class RecordingExportAPITests(TestCase):
+    """GET /recordings/<id>/export/ - Phase 8 approved-eDAR export
+    (docs/phase8-export.md). Reuses the exact authorization scenarios Phase 2-7
+    already established for this resource."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            email='owner8@example.com', password='pw', name='Owner Officer', role='OFFICER'
+        )
+        self.other_officer = User.objects.create_user(
+            email='other8@example.com', password='pw', name='Other Officer', role='OFFICER'
+        )
+        self.reviewer = User.objects.create_user(
+            email='reviewer8@example.com', password='pw', name='Reviewer One', role='REVIEWER'
+        )
+        self.admin = User.objects.create_user(
+            email='admin8@example.com', password='pw', name='Admin One', role='ADMIN'
+        )
+        self.recording = Recording.objects.create(
+            officer=self.owner, status='READY_FOR_REVIEW', case_fir_number='FIR-2026-042',
+            gps_latitude=22.3072, gps_longitude=73.1812,
+        )
+
+    def _client_as(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def _export(self, user=None):
+        client = self._client_as(user) if user else APIClient()
+        return client.get(f'/recordings/{self.recording.recording_id}/export/')
+
+    def _ai_row(self, edar_record, field_key, known='KNOWN', value=None, evidence='evidence'):
+        return EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key=field_key, layer='AI', known=known, value=value,
+            confidence=0.9 if known == 'KNOWN' else None,
+            source_transcript_segment=evidence if known == 'KNOWN' else None,
+            extraction_version='gemini-3.8-flash/prompt-v2/schema-0.1.0',
+        )
+
+    def _make_and_approve(self, edits=None):
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        self._ai_row(edar_record, 'road_name', value='NH 48')
+        self._ai_row(edar_record, 'crash_date', known='UNKNOWN')
+        self._ai_row(edar_record, 'hit_and_run_flag', value=False)
+        self._ai_row(edar_record, 'vehicle.1.vehicle_type', value='motorcycle')
+        self._ai_row(edar_record, 'vehicle.2.vehicle_type', value='car')
+        self._ai_row(edar_record, 'casualty.1.person_type', value='rider')
+        self._ai_row(edar_record, 'casualty.1.injury_severity', value='grievous injury')
+        self._ai_row(edar_record, 'officer_remarks', value='No markings near the curve.')
+        approval_service.approve_edar(edar_record=edar_record, officer=self.owner, edits=edits or {})
+        return edar_record
+
+    # --- Authorization / IDOR ------------------------------------------
+
+    def test_unauthenticated_request_is_rejected(self):
+        self._make_and_approve()
+        self.assertEqual(self._export().status_code, 401)
+
+    def test_owner_can_export_approved_recording(self):
+        self._make_and_approve()
+        response = self._export(self.owner)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_reviewer_can_export(self):
+        self._make_and_approve()
+        response = self._export(self.reviewer)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_admin_can_export(self):
+        self._make_and_approve()
+        response = self._export(self.admin)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_other_officer_cannot_export(self):
+        self._make_and_approve()
+        response = self._export(self.other_officer)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.data['status'])
+
+    def test_missing_recording_returns_existing_not_found_behavior(self):
+        client = self._client_as(self.owner)
+        response = client.get('/recordings/999999/export/')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('not found', response.data['message'].lower())
+
+    # --- Approval requirement -------------------------------------------
+
+    def test_no_eDAR_extraction_at_all_is_rejected(self):
+        response = self._export(self.owner)
+        self.assertEqual(response.status_code, 400)
+
+    def test_ai_only_record_not_approved_is_rejected(self):
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        self._ai_row(edar_record, 'road_name', value='NH 48')
+        response = self._export(self.owner)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('not been approved', response.data['message'])
+
+    def test_structurally_incomplete_approved_snapshot_is_rejected_not_fabricated(self):
+        # review_status says APPROVED but (defensively, a state Phase 6's own
+        # invariant should prevent) zero APPROVED rows exist - export must fail
+        # loudly, never fabricate a dataset.
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='APPROVED')
+        response = self._export(self.owner)
+        self.assertEqual(response.status_code, 400)
+
+    def test_already_exported_recording_can_be_exported_again(self):
+        # Export is read-only - repeatability is expected, not a "duplicate" error.
+        self._make_and_approve()
+        first = self._export(self.owner)
+        second = self._export(self.owner)
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+
+    # --- AI vs APPROVED (mandatory) --------------------------------------
+
+    def test_approved_edit_appears_in_export_ai_value_never_does(self):
+        self._make_and_approve(edits={'road_name': {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'}})
+        response = self._export(self.owner)
+        road_name = response.data['data']['eDAR']['crashIdentification']['road_name']
+        self.assertEqual(road_name, {'known': 'KNOWN', 'value': 'NH 48, Ahmedabad'})
+        self.assertNotIn('NH 48', str(response.data).replace('NH 48, Ahmedabad', ''))
+
+    def test_ai_row_mutated_after_approval_does_not_leak_into_export(self):
+        edar_record = self._make_and_approve()
+        ai_row = EdarFieldValue.objects.get(edar_record=edar_record, field_key='road_name', layer='AI')
+        ai_row.value = 'TAMPERED-AI-VALUE-SHOULD-NEVER-APPEAR'
+        ai_row.save(update_fields=['value'])
+
+        response = self._export(self.owner)
+        self.assertNotIn('TAMPERED-AI-VALUE-SHOULD-NEVER-APPEAR', str(response.data))
+        self.assertEqual(response.data['data']['eDAR']['crashIdentification']['road_name']['value'], 'NH 48')
+
+    def test_export_never_reads_ai_layer_for_any_field(self):
+        edar_record = self._make_and_approve()
+        EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI').update(
+            value='TAMPERED', confidence=0.01,
+        )
+        response = self._export(self.owner)
+        self.assertNotIn('TAMPERED', str(response.data))
+
+    # --- Content -----------------------------------------------------------
+
+    def test_export_contains_approved_values_correctly_grouped(self):
+        self._make_and_approve()
+        edar = self._export(self.owner).data['data']['eDAR']
+        self.assertEqual(edar['crashIdentification']['road_name'], {'known': 'KNOWN', 'value': 'NH 48'})
+        self.assertEqual(edar['crashCircumstances']['hit_and_run_flag'], {'known': 'KNOWN', 'value': False})
+        self.assertEqual(edar['officerAssessment']['officer_remarks']['value'], 'No markings near the curve.')
+
+    def test_repeated_vehicle_and_casualty_structures_preserved_not_flattened(self):
+        self._make_and_approve()
+        edar = self._export(self.owner).data['data']['eDAR']
+        self.assertEqual(len(edar['vehicles']), 2)
+        self.assertEqual(edar['vehicles'][0]['vehicle_type'], {'known': 'KNOWN', 'value': 'motorcycle'})
+        self.assertEqual(edar['vehicles'][1]['vehicle_type'], {'known': 'KNOWN', 'value': 'car'})
+        self.assertEqual(len(edar['casualties']), 1)
+        self.assertEqual(edar['casualties'][0]['person_type']['value'], 'rider')
+        self.assertEqual(edar['casualties'][0]['injury_severity']['value'], 'grievous injury')
+        # No dotted vehicle.N./casualty.N. keys anywhere - properly nested, not a
+        # flat re-export of the storage representation.
+        self.assertNotIn('vehicle.1.vehicle_type', str(edar))
+
+    def test_no_duplicate_or_omitted_approved_fields(self):
+        # A realistic, COMPLETE AI candidate (every flat field, matching what
+        # csc_apps.processing.extraction_service._build_rows always produces for a
+        # real Gemini run - docs/phase4-gemini-edar-extraction.md), not the minimal
+        # subset _make_and_approve() uses elsewhere in this class. Proves the
+        # export's field-for-field completeness against the real production
+        # guarantee, not an artificial fixture.
+        from csc_apps.edar.schema_loader import load_schema
+        from csc_apps.processing.providers.gemini.schema_adapter import flat_field_keys, repeating_field_keys
+
+        schema = load_schema()
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        for key in flat_field_keys(schema):
+            self._ai_row(edar_record, key, known='UNKNOWN')
+        for base_key in repeating_field_keys(schema, 'vehicle'):
+            self._ai_row(edar_record, f'vehicle.1.{base_key}', value='x')
+        for base_key in repeating_field_keys(schema, 'casualty'):
+            self._ai_row(edar_record, f'casualty.1.{base_key}', value='x')
+        approval_service.approve_edar(edar_record=edar_record, officer=self.owner, edits={})
+
+        approved_keys = set(
+            EdarFieldValue.objects.filter(edar_record=edar_record, layer='APPROVED').values_list('field_key', flat=True)
+        )
+        edar = self._export(self.owner).data['data']['eDAR']
+        exported_keys = set(edar['crashIdentification']) | set(edar['roadEnvironment']) | set(edar['crashCircumstances'])
+        exported_keys |= set(edar['infrastructureObservations']) | set(edar['officerAssessment'])
+        exported_keys |= {f'vehicle.{i + 1}.{k}' for i, v in enumerate(edar['vehicles']) for k in v}
+        exported_keys |= {f'casualty.{i + 1}.{k}' for i, v in enumerate(edar['casualties']) for k in v}
+        # gps_coordinates is the one Module A key never stored as an EdarFieldValue
+        # row at all (docs/phase8-export.md) - excluded from both sides on purpose.
+        self.assertEqual(approved_keys, exported_keys)
+
+    def test_unknown_known_state_preserved_not_converted_to_empty(self):
+        self._make_and_approve()
+        crash_date = self._export(self.owner).data['data']['eDAR']['crashIdentification']['crash_date']
+        self.assertEqual(crash_date, {'known': 'UNKNOWN', 'value': None})
+
+    def test_not_applicable_and_uncertain_known_states_preserved(self):
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        self._ai_row(edar_record, 'road_name', value='NH 48')
+        approval_service.approve_edar(
+            edar_record=edar_record, officer=self.owner,
+            edits={
+                'road_name': {'known': 'NOT_APPLICABLE', 'value': None},
+            },
+        )
+        edar = self._export(self.owner).data['data']['eDAR']
+        self.assertEqual(edar['crashIdentification']['road_name'], {'known': 'NOT_APPLICABLE', 'value': None})
+
+    def test_gps_coordinates_come_from_recording_not_eDAR_layer(self):
+        self._make_and_approve()
+        data = self._export(self.owner).data['data']
+        self.assertEqual(data['gpsCoordinates']['latitude'], 22.3072)
+        self.assertEqual(data['gpsCoordinates']['longitude'], 73.1812)
+        self.assertNotIn('gps_coordinates', data['eDAR']['crashIdentification'])
+
+    def test_gps_coordinates_null_when_not_captured(self):
+        self.recording.gps_latitude = None
+        self.recording.gps_longitude = None
+        self.recording.save(update_fields=['gps_latitude', 'gps_longitude'])
+        self._make_and_approve()
+        self.assertIsNone(self._export(self.owner).data['data']['gpsCoordinates'])
+
+    def test_export_metadata_present(self):
+        self._make_and_approve()
+        data = self._export(self.owner).data['data']
+        self.assertEqual(data['recordingId'], self.recording.recording_id)
+        self.assertEqual(data['caseFirNumber'], 'FIR-2026-042')
+        self.assertEqual(data['reviewStatus'], 'APPROVED')
+        self.assertEqual(data['approvedBy']['userId'], self.owner.user_id)
+        self.assertIsNotNone(data['approvedAt'])
+
+    # --- API shape / security ------------------------------------------
+
+    def test_response_follows_pms_envelope(self):
+        self._make_and_approve()
+        response = self._export(self.owner)
+        self.assertEqual(set(response.data.keys()), {'status', 'message', 'data'})
+
+    def test_response_content_type_is_json(self):
+        self._make_and_approve()
+        response = self._export(self.owner)
+        self.assertIn('application/json', response['Content-Type'])
+
+    def test_no_content_disposition_header_not_a_file_download(self):
+        # docs/phase8-export.md §Response shape - a normal enveloped API response,
+        # not a raw downloadable attachment (no such precedent exists in PMS).
+        self._make_and_approve()
+        response = self._export(self.owner)
+        self.assertNotIn('Content-Disposition', response)
+
+    def test_no_secrets_transcripts_or_provider_internals_in_export(self):
+        edar_record = EdarRecord.objects.create(recording=self.recording, review_status='PENDING_REVIEW')
+        self._ai_row(edar_record, 'road_name', value='NH 48', evidence='SECRET-TRANSCRIPT-TEXT')
+        approval_service.approve_edar(edar_record=edar_record, officer=self.owner, edits={})
+        response = self._export(self.owner)
+        rendered = str(response.data)
+        for forbidden in (
+            'SECRET-TRANSCRIPT-TEXT', 'request_id', 'api_key', 'GEMINI', 'SARVAM',
+            'confidence', 'evidence', 'extraction_version', 'Bearer', 'Traceback',
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    # --- Performance --------------------------------------------------
+
+    def test_export_query_count_is_bounded(self):
+        self._make_and_approve()
+        with CaptureQueriesContext(connection) as ctx:
+            response = self._export(self.owner)
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(len(ctx.captured_queries), 10)
+
+
+class RecordingGetAllAPITests(TestCase):
+    """GET /recordings/get_all/ - Phase 10A (docs/phase10a-get-all-and-smoke-
+    test.md). A lightweight index, deliberately distinct from the paginated
+    GET /recordings/ (Phase 7)."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            email='getall_owner@example.com', password='pw', name='Owner Officer', role='OFFICER'
+        )
+        self.other_officer = User.objects.create_user(
+            email='getall_other@example.com', password='pw', name='Other Officer', role='OFFICER'
+        )
+        self.reviewer = User.objects.create_user(
+            email='getall_reviewer@example.com', password='pw', name='Reviewer One', role='REVIEWER'
+        )
+        self.admin = User.objects.create_user(
+            email='getall_admin@example.com', password='pw', name='Admin One', role='ADMIN'
+        )
+
+    def _client_as(self, user):
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def _get_all(self, user=None):
+        client = self._client_as(user) if user else APIClient()
+        return client.get('/recordings/get_all/')
+
+    def test_unauthenticated_request_is_rejected(self):
+        self.assertEqual(self._get_all().status_code, 401)
+
+    def test_authenticated_request_succeeds(self):
+        Recording.objects.create(officer=self.owner, status='PROCESSING')
+        response = self._get_all(self.owner)
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_authenticated_user_sees_own_recordings(self):
+        recording = Recording.objects.create(officer=self.owner, status='PROCESSING')
+        ids = [r['recordingId'] for r in self._get_all(self.owner).data['data']]
+        self.assertIn(recording.recording_id, ids)
+
+    def test_another_officers_recordings_are_excluded(self):
+        Recording.objects.create(officer=self.other_officer, status='COMPLETED')
+        self.assertEqual(self._get_all(self.owner).data['data'], [])
+
+    def test_reviewer_sees_only_their_own_recordings(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        own = Recording.objects.create(officer=self.reviewer, status='PROCESSING')
+        ids = [r['recordingId'] for r in self._get_all(self.reviewer).data['data']]
+        self.assertEqual(ids, [own.recording_id])
+
+    def test_admin_sees_only_their_own_recordings(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        own = Recording.objects.create(officer=self.admin, status='PROCESSING')
+        ids = [r['recordingId'] for r in self._get_all(self.admin).data['data']]
+        self.assertEqual(ids, [own.recording_id])
+
+    def test_multiple_statuses_all_appear_not_only_completed(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        Recording.objects.create(officer=self.owner, status='PROCESSING')
+        Recording.objects.create(officer=self.owner, status='FAILED')
+        Recording.objects.create(officer=self.owner, status='READY_FOR_REVIEW')
+        statuses = {r['status'] for r in self._get_all(self.owner).data['data']}
+        self.assertEqual(statuses, {'COMPLETED', 'PROCESSING', 'FAILED', 'READY_FOR_REVIEW'})
+
+    def test_completed_recording_shows_completed_status(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        self.assertEqual(self._get_all(self.owner).data['data'][0]['status'], 'COMPLETED')
+
+    def test_processing_recording_shows_its_current_status(self):
+        Recording.objects.create(officer=self.owner, status='PROCESSING')
+        self.assertEqual(self._get_all(self.owner).data['data'][0]['status'], 'PROCESSING')
+
+    def test_failed_recording_shows_its_current_status(self):
+        Recording.objects.create(officer=self.owner, status='FAILED')
+        self.assertEqual(self._get_all(self.owner).data['data'][0]['status'], 'FAILED')
+
+    def test_response_contains_only_intended_basic_fields(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED', road_name='NH 48', case_fir_number='FIR-1')
+        row = self._get_all(self.owner).data['data'][0]
+        self.assertEqual(set(row.keys()), {'recordingId', 'status', 'createdAt'})
+
+    def test_transcript_is_not_exposed(self):
+        recording = Recording.objects.create(officer=self.owner, status='PROCESSING')
+        ProcessingJob.objects.create(recording=recording, job_type='STT', status='SUCCEEDED')
+        Transcript.objects.create(
+            recording=recording, language='ORIGINAL', text='SECRET-TRANSCRIPT-TEXT',
+            detected_language_code='hi-IN', provider_name='sarvam',
+        )
+        response = self._get_all(self.owner)
+        self.assertNotIn('SECRET-TRANSCRIPT-TEXT', str(response.data))
+        self.assertNotIn('transcript', str(response.data).lower())
+
+    def test_edar_is_not_exposed(self):
+        recording = Recording.objects.create(officer=self.owner, status='READY_FOR_REVIEW')
+        edar_record = EdarRecord.objects.create(recording=recording, review_status='PENDING_REVIEW')
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='road_name', layer='AI', known='KNOWN',
+            value='SECRET-ROAD-NAME', confidence=0.9, extraction_version='v',
+        )
+        response = self._get_all(self.owner)
+        self.assertNotIn('SECRET-ROAD-NAME', str(response.data))
+        self.assertNotIn('edar', str(response.data).lower())
+
+    def test_no_credentials_or_internals_exposed(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        rendered = str(self._get_all(self.owner).data)
+        for forbidden in ('request_id', 'api_key', 'GEMINI', 'SARVAM', 'Bearer', 'Traceback'):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_deterministic_ordering_newest_first(self):
+        first = Recording.objects.create(officer=self.owner, status='COMPLETED')
+        second = Recording.objects.create(officer=self.owner, status='PROCESSING')
+        ids = [r['recordingId'] for r in self._get_all(self.owner).data['data']]
+        self.assertEqual(ids, [second.recording_id, first.recording_id])
+
+    def test_empty_result_returns_200_with_empty_list(self):
+        response = self._get_all(self.owner)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['data'], [])
+
+    def test_response_follows_pms_envelope(self):
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        response = self._get_all(self.owner)
+        self.assertEqual(set(response.data.keys()), {'status', 'message', 'data'})
+
+    def test_data_is_a_plain_list_not_paginated(self):
+        # Deliberately different shape from GET /recordings/ (Phase 7), which
+        # wraps its list in {data, presentPage, totalPage, ...}.
+        Recording.objects.create(officer=self.owner, status='COMPLETED')
+        response = self._get_all(self.owner)
+        self.assertIsInstance(response.data['data'], list)
+
+    def test_query_count_does_not_scale_with_recording_count(self):
+        for _ in range(3):
+            Recording.objects.create(officer=self.owner, status='COMPLETED')
+        with CaptureQueriesContext(connection) as small:
+            self._get_all(self.owner)
+        for _ in range(10):
+            Recording.objects.create(officer=self.owner, status='COMPLETED')
+        with CaptureQueriesContext(connection) as large:
+            self._get_all(self.owner)
+        self.assertEqual(len(small.captured_queries), len(large.captured_queries))
+        self.assertLessEqual(len(large.captured_queries), 3)

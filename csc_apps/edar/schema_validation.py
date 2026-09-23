@@ -102,6 +102,34 @@ def validate_extraction_entry(entry: dict, schema: dict | None = None) -> None:
             )
 
 
+_KNOWN_STATES = ('KNOWN', 'UNKNOWN', 'NOT_APPLICABLE', 'UNCERTAIN')
+
+
+def validate_approved_value(field_key: str, known: str, value, schema: dict | None = None) -> None:
+    """Validates one officer-submitted field edit for Phase 6 approval
+    (docs/phase6-officer-review-approval.md §Validation). Reuses the same
+    structural/type checks Phase 4/5 apply to AI output (`_validate_value_type`) -
+    officer input gets no separate, second-guessed validation engine. Unlike an AI
+    entry, there is no confidence/evidence to cross-check: a human reviewer is
+    asserting the value directly, not offering a model-generated signal.
+    `known` follows the existing EdarFieldValue.KNOWN_CHOICES states
+    (docs/unknown-data-policy.md) - unchanged from what the AI layer already uses, no
+    new convention. A non-KNOWN state must carry a null value, same as every AI
+    UNKNOWN row already does."""
+    schema = schema or load_schema()
+    field_def = resolve_field_key(field_key, schema=schema)
+
+    if known not in _KNOWN_STATES:
+        raise EdarValidationError('invalid_known_state', f'"{field_key}": {known!r} is not a valid known state')
+
+    if known == 'KNOWN':
+        if value is None:
+            raise EdarValidationError('missing_value', f'"{field_key}": known=KNOWN requires a non-null value')
+        _validate_value_type(field_key, value, field_def)
+    elif value is not None:
+        raise EdarValidationError('value_not_allowed', f'"{field_key}": known={known} must have a null value')
+
+
 def _validate_value_type(field_key: str, value, field_def: dict) -> None:
     """Layer 1 (structural/type) validation for a non-null value
     (docs/phase4-gemini-edar-extraction.md §Schema validation, source instructions
@@ -112,6 +140,18 @@ def _validate_value_type(field_key: str, value, field_def: dict) -> None:
     "resolved_from_source"`, checked below like any other field with real allowed
     values."""
     data_type = field_def['data_type']
+
+    # Plain string-shaped types (docs/domain-model.md - the JSON type Gemini's own
+    # response_json_schema already enforces for AI output, per
+    # csc_apps.processing.providers.gemini.schema_adapter's _DATA_TYPE_JSON_TYPE
+    # mapping). AI values never needed this check to actually reject anything -
+    # Gemini's request-time schema already constrained the type before this ever
+    # ran. Officer-submitted values (Phase 6) have no such upstream gate; DRF's
+    # JSONField happily accepts `123` for a string field, so this check is what
+    # actually rejects it (found via a Phase 6 acceptance test, not a hypothetical).
+    if data_type in ('string', 'categorical', 'ordinal', 'categorical_or_text', 'text_or_categorical', 'free_text'):
+        if not isinstance(value, str):
+            raise EdarValidationError('invalid_type', f'"{field_key}" is {data_type} but got {value!r}')
 
     if data_type == 'boolean' and not isinstance(value, bool):
         raise EdarValidationError('invalid_type', f'"{field_key}" is boolean but got {value!r}')

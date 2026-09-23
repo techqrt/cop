@@ -1,3 +1,5 @@
+from urllib.parse import unquote_plus
+
 from rest_framework import status
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -85,7 +87,14 @@ class Utils:
                 key, value = pair.split('=', 1)
             else:
                 key, value = pair, ''
-            query_params[key] = value
+            # `request.get_full_path()` returns the raw, still percent-/plus-encoded
+            # query string (Django never decodes it for us here) - a filter value
+            # containing a space or other reserved character (e.g. Phase 7's
+            # `road_name` free-text search, docs/phase7-history-search.md) would
+            # otherwise reach the serializer still encoded (`"NH+48"`/`"NH%2048"`
+            # instead of `"NH 48"`). No prior query param in this codebase
+            # contained a space, so this never surfaced before.
+            query_params[unquote_plus(key)] = unquote_plus(value)
         return query_params
 
     def validator(self, serializer):

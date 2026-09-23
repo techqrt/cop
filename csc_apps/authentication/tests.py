@@ -84,3 +84,81 @@ class JWTAuthenticationTests(TestCase):
     def test_missing_bearer_header_returns_none(self):
         django_request = RequestFactory().get('/any-protected-path/')
         self.assertIsNone(JWTAuthentication().authenticate(Request(django_request)))
+
+
+class Phase9AuthenticationHardeningTests(TestCase):
+    """docs/phase9-security-audit-observability.md §Authentication - regression
+    coverage for token/identity edge cases beyond Phase 0's happy-path tests."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='officer9@example.com', password='pw', name='Officer Nine', role='OFFICER'
+        )
+
+    def test_missing_token_is_rejected(self):
+        response = APIClient().get('/recordings/')
+        self.assertEqual(response.status_code, 401)
+
+    def test_malformed_token_is_rejected(self):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION='Bearer not-a-real-jwt')
+        response = client.get('/recordings/')
+        self.assertEqual(response.status_code, 403)
+
+    def test_invalid_signature_token_is_rejected(self):
+        import jwt as pyjwt
+
+        forged = pyjwt.encode({'user_id': self.user.user_id, 'role': 'ADMIN'}, 'wrong-secret', algorithm='HS256')
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {forged}')
+        response = client.get('/recordings/')
+        self.assertEqual(response.status_code, 403)
+
+    def test_token_cannot_impersonate_another_user_via_edited_payload(self):
+        # A token re-signed for a different user_id is rejected the same way a
+        # forged signature is - JWTAuthentication verifies the signature against
+        # settings.SECRET_KEY, which the client never has.
+        other = User.objects.create_user(email='other9@example.com', password='pw', name='Other', role='ADMIN')
+        import jwt as pyjwt
+
+        forged = pyjwt.encode({'user_id': other.user_id, 'role': 'ADMIN'}, 'attacker-guessed-secret', algorithm='HS256')
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {forged}')
+        response = client.get('/recordings/')
+        self.assertEqual(response.status_code, 403)
+
+    def test_authenticated_identity_is_resolved_server_side_not_from_request_body(self):
+        # request.params.user_id is set by SerializerValidations from the
+        # authenticated request.user, never from client-supplied JSON - a body
+        # claiming a different userId must not change who the action is recorded
+        # against.
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+        response = client.get('/recordings/', {'userId': 999999, 'user_id': 999999})
+        self.assertEqual(response.status_code, 200)
+
+    def test_login_produces_an_activity_log_entry(self):
+        from csc_apps.activity_log.models import ActivityLog
+
+        APIClient().post('/auth/login/', {'email': 'officer9@example.com', 'password': 'pw'})
+        log = ActivityLog.objects.filter(user=self.user, action='Read', details__event='login').first()
+        self.assertIsNotNone(log)
+
+    def test_login_audit_never_contains_password_or_token(self):
+        from csc_apps.activity_log.models import ActivityLog
+
+        response = APIClient().post('/auth/login/', {'email': 'officer9@example.com', 'password': 'pw'})
+        token = response.data['data']['token']
+        log = ActivityLog.objects.get(user=self.user, action='Read')
+        rendered = str(log.details)
+        self.assertNotIn('pw', rendered)
+        self.assertNotIn(token, rendered)
+
+    def test_failed_login_does_not_create_activity_log_entry(self):
+        # No failed-login-attempt tracking was built in Phase 9 (deliberate scope
+        # boundary - docs/phase9-security-audit-observability.md §Remaining risks) -
+        # only successful, identity-attributable logins are audited.
+        from csc_apps.activity_log.models import ActivityLog
+
+        APIClient().post('/auth/login/', {'email': 'officer9@example.com', 'password': 'wrong'})
+        self.assertFalse(ActivityLog.objects.filter(details__event='login').exists())

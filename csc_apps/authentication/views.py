@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from csc.config import Configurations
 from csc.constants import Constants
+from csc_apps.activity_log.models import ActivityLog
 from csc_apps.authentication.dataclasses.request.login import LoginRequest
 from csc_apps.authentication.models import User
 from csc_apps.authentication.serializers.response.login import LoginResponseSerializer
@@ -46,6 +47,13 @@ class AuthView:
             # Overwriting access_token here is what invalidates every token issued
             # before this login (docs/security-baseline.md §1).
             User.objects.filter(user_id=user.user_id).update(access_token=token)
+
+            # Phase 9 audit coverage (docs/phase9-security-audit-observability.md
+            # §ActivityLog) - identifies who logged in and when only. Never the
+            # token/password: `details` carries just the event name, and
+            # ActivityLog.record() itself never accepts or stores a token/password
+            # argument at all.
+            ActivityLog.record(user=user, action='Read', model='User', details={'event': 'login'})
 
         return Response(
             status=status.HTTP_200_OK,

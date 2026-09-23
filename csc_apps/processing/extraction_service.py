@@ -27,6 +27,7 @@ from csc_apps.processing.providers.base import ExtractedField, ExtractionProvide
 from csc_apps.processing.providers.gemini.provider import GeminiExtractionProvider
 from csc_apps.processing.providers.gemini.schema_adapter import flat_field_keys, repeating_field_keys
 from csc_apps.recordings.models.audio import Transcript
+from csc_apps.recordings.state_machine import can_transition, transition
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,15 @@ def _record_success(
         job.completed_at = timezone.now()
         job.provider_metadata = {}
         job.save(update_fields=['status', 'completed_at', 'provider_metadata'])
+
+        # docs/processing-pipeline.md §Persist AI Result, docs/recording-state-
+        # machine.md §READY_FOR_REVIEW: an AI eDAR candidate now exists, which is
+        # exactly what that state represents - deferred through Phase 2-5 pending an
+        # actual review mechanism (Phase 6). Guarded by can_transition rather than
+        # asserting PROCESSING, so re-extracting an already-reviewed recording never
+        # raises here - review/approval state is untouched either way.
+        if can_transition(recording.status, 'READY_FOR_REVIEW'):
+            transition(recording, 'READY_FOR_REVIEW')
 
         metrics = report['metrics']
         ProcessingEvent.objects.create(

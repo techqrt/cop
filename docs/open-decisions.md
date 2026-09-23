@@ -19,8 +19,17 @@ mandatory separate Reviewer role; (c) configurable per deployment.
 **Recommended:** (b) — matches the brief's "AI-generated data" vs. "human-approved record"
 language most literally, and is the safer default for an evidentiary system (an officer
 shouldn't be the sole check on their own report).
-**Status:** Open. Interim default used in Phase 0 docs/models: role exists
-(`REVIEWER`), assignment mechanism undecided.
+**Phase 6 status:** Narrowed, not fully closed
+(`docs/phase6-officer-review-approval.md`). The owning officer OR any
+REVIEWER/ADMIN may approve - option (a) and (b) both apply rather than choosing
+one exclusively, the smallest change from the authorization rule
+`GET /recordings/<id>/` already used. Still unresolved: whether review should
+ever be *mandatory* for a second person (vs. this phase's "either may act"), and
+any assignment/queue mechanism ("recordings pending my review" - no such view
+exists yet).
+**Status:** Open. Interim default used from Phase 0 through Phase 6: role exists
+(`REVIEWER`), assignment mechanism undecided, both owner and REVIEWER/ADMIN may
+approve.
 
 ### OD-002 — Which STT / translation / extraction providers?
 **Question:** No provider is named in the brief for any of the three AI stages.

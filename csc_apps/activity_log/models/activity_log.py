@@ -16,6 +16,12 @@ class ActivityLog(models.Model):
         ('Create', 'Create'),
         ('Update', 'Update'),
         ('Delete', 'Delete'),
+        # Phase 9 (docs/phase9-security-audit-observability.md §ActivityLog) - the
+        # fourth standard CRUD verb, for a significant read/access event that isn't
+        # a mutation: login and eDAR export. `details['event']` disambiguates which
+        # one, the same way `model`/`details` already carry the specifics for
+        # Create/Update - not a one-off action name per event type.
+        ('Read', 'Read'),
     )
 
     log_id = models.AutoField(primary_key=True)

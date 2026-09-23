@@ -27,14 +27,37 @@ the source brief, and OD-007 for the exact permission matrix per role). This rep
 department-string permission matrix (`docs/pms-reference-analysis.md` §7), which doesn't fit
 CSC — there is one domain (crash reporting), not many departments.
 
-Baseline authorization rules (enforced, not yet all wired to endpoints since most endpoints
-don't exist yet — `docs/api-architecture.md` §3):
+Baseline authorization rules, as actually enforced by Phase 2-8 (superseding this section's
+original Phase 0 speculation below where the two disagree — see the note at the end of this
+section):
 - A recording's `Audio`, `Transcript`, and `EdarRecord` are visible only to its owning
   `Officer` and to `Reviewer`/`Admin` roles — never to another Officer.
-- Only `Reviewer`/`Admin` may write to the `APPROVED` layer of `EdarFieldValue`.
+- **Corrected from Phase 0's original text below:** the owning `Officer` — not only
+  `Reviewer`/`Admin` — may write to the `APPROVED` layer of `EdarFieldValue`, via
+  `POST /recordings/<id>/edar/approve/`. This was an explicit Phase 6 product decision
+  (`docs/phase6-officer-review-approval.md`, ADR-020), confirmed again for Phase 9
+  (`docs/phase9-security-audit-observability.md` §4) rather than silently left inconsistent
+  with this document.
 - `Admin` is the only role permitted to hard-delete a `Recording` (and, per ADR-002, even
   `Admin` cannot delete a `Recording` with an `Audio` row via cascade — deletion of evidence
-  requires an explicit, separately-audited action, not a default `DELETE` endpoint).
+  requires an explicit, separately-audited action, not a default `DELETE` endpoint). No
+  delete endpoint exists as of Phase 9.
+
+### Resource/role matrix (Phase 2-8, as implemented)
+
+| Resource/action | Owner | REVIEWER | ADMIN | Other officer |
+|---|---|---|---|---|
+| Upload (`POST /recordings/`) | ✅ (becomes owner) | ✅ (becomes owner) | ✅ (becomes owner) | n/a — every authenticated role may upload (OD-007 interim default) |
+| History/list (`GET /recordings/`) | own only | own only | own only | ✅ own only |
+| Detail (`GET /recordings/<id>/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+| Approve (`POST /recordings/<id>/edar/approve/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+| Export (`GET /recordings/<id>/export/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+
+The list/history scope (own recordings only, for every role including REVIEWER/ADMIN) is
+deliberately narrower than detail/approve/export (owner OR REVIEWER/ADMIN) — a confirmed
+Phase 7 product decision (`docs/phase7-history-search.md` §4, ADR-021), not an
+inconsistency: a REVIEWER/ADMIN can still open, approve, or export any recording directly
+by ID, they just don't see other officers' recordings in their own list.
 
 ## 3. Audio storage
 
@@ -92,6 +115,15 @@ from "assigned lead" to "recording owner."
   transcript content, if ever needed for troubleshooting, must be explicitly
   scoped/redactable and off by default, since a crash-scene transcript can contain names,
   medical detail, and other sensitive personal information.
+- Verified for Phase 9 (`docs/phase9-security-audit-observability.md` §Logging): every
+  `logger.*()` call in `csc_apps.processing.{stt,translation,extraction}_service` passes
+  only job/recording IDs, the controlled `error_code`, status, and duration/count metrics —
+  never a raw provider exception message, never transcript/eDAR content. A structural test
+  (AST-based, not just a spot check) guards against a future call site regressing this.
+- `ActivityLog` now also covers login (`action='Read', model='User'`) and eDAR export
+  (`action='Read', model='EdarRecord'`) — see `docs/phase9-security-audit-observability.md`
+  §ActivityLog. Neither entry stores the token/password or the exported payload; `details`
+  carries only an `event` name and relevant IDs.
 
 ## 7. What Phase 0 implements vs. documents
 

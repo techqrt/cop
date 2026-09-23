@@ -56,11 +56,41 @@ class EdarFieldDataSerializer(serializers.Serializer):
     warnings = serializers.ListField(child=serializers.CharField(), read_only=True)
 
 
+class ApprovedFieldDataSerializer(serializers.Serializer):
+    """One eDAR field's APPROVED-layer state (docs/phase6-officer-review-approval.md
+    §API representation). No confidence/evidence here - that provenance belongs to
+    the AI layer (`edar.fields`), reachable from the same field_key; the APPROVED
+    layer is the officer's asserted value, not a model-generated signal."""
+
+    value = serializers.JSONField(read_only=True, allow_null=True)
+    known = serializers.CharField(read_only=True)
+
+
+class ReviewedBySerializer(serializers.Serializer):
+    userId = serializers.IntegerField(read_only=True)
+    name = serializers.CharField(read_only=True)
+    email = serializers.CharField(read_only=True)
+
+
+class ApprovedEdarSerializer(serializers.Serializer):
+    """Null until an officer approves (docs/phase6-officer-review-approval.md
+    §GET behavior after approval) - never fabricated, same "null while absent"
+    convention as `transcript.english`/`edar` itself before their stage completes."""
+
+    reviewedBy = ReviewedBySerializer(read_only=True)
+    reviewedAt = serializers.CharField(read_only=True, allow_null=True)
+    fields = serializers.DictField(child=ApprovedFieldDataSerializer(), read_only=True)
+
+
 class EdarDataSerializer(serializers.Serializer):
     layer = serializers.CharField(read_only=True)
+    # PENDING_REVIEW/IN_REVIEW/APPROVED - EdarRecord.review_status verbatim, no new
+    # convention (docs/phase6-officer-review-approval.md §Review status).
+    reviewStatus = serializers.CharField(read_only=True)
     quality = EdarQualitySerializer(read_only=True, allow_null=True)
     provenance = EdarProvenanceSerializer(read_only=True)
     fields = serializers.DictField(child=EdarFieldDataSerializer(), read_only=True)
+    approved = ApprovedEdarSerializer(read_only=True, allow_null=True)
 
 
 class RecordingDetailDataSerializer(serializers.Serializer):

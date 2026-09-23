@@ -21,3 +21,11 @@ class ActivityLogRecordTests(TestCase):
         self.assertEqual(log.user_id, self.user.user_id)
         self.assertEqual(log.action, 'Update')
         self.assertEqual(log.details, {'field_key': 'crash_date'})
+
+    def test_read_action_is_a_valid_choice(self):
+        # Phase 9 (docs/phase9-security-audit-observability.md) - login and export
+        # auditing both use this fourth, generic CRUD-style verb rather than a
+        # one-off action name per event type.
+        log = ActivityLog.record(user=self.user, action='Read', model='User', details={'event': 'login'})
+        self.assertIn('Read', dict(ActivityLog.ACTION_CHOICES))
+        self.assertEqual(log.action, 'Read')
