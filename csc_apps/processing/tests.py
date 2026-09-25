@@ -279,7 +279,9 @@ class SttServiceTests(TestCase):
             file_size_bytes=stored.size_bytes,
             checksum_sha256=stored.checksum_sha256,
         )
-        self.job = ProcessingJob.objects.create(recording=self.recording, job_type='STT', status='PENDING')
+        self.job = ProcessingJob.objects.create(
+            recording=self.recording, job_type='STT', audio=self.audio, status='PENDING'
+        )
 
     @staticmethod
     def _audio_file():

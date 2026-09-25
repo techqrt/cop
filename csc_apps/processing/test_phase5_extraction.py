@@ -235,9 +235,14 @@ class RecordingDetailQualityAPITests(Phase5Base):
         self.assertEqual(other.status_code, 400)
         self.assertNotIn('edar', str(other.data.get('data')))
 
-    def test_endpoint_is_read_only(self):
+    def test_endpoint_is_read_only_for_unsupported_methods(self):
+        # PUT is deliberately excluded from this loop since Phase 10B
+        # (docs/phase10b-supplemental-audio.md): it is now a real, documented
+        # mutation on this same path (supplemental audio) - covered by its own
+        # tests in recordings.tests.RecordingSupplementAudioAPITests, not here.
+        # PATCH/DELETE remain genuinely unsupported.
         client = APIClient()
         client.force_authenticate(user=self.officer)
-        for method in ('put', 'patch', 'delete'):
+        for method in ('patch', 'delete'):
             response = getattr(client, method)(f'/recordings/{self.recording.recording_id}/', {})
             self.assertEqual(response.status_code, 405, method)

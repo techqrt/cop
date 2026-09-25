@@ -187,6 +187,100 @@ def build_casualties_response_schema(edar_schema: dict) -> dict:
     }
 
 
+def _partial_repeating_item_schema(module: dict, base_keys: list[str]) -> dict:
+    """Same shape as _repeating_item_schema, restricted to `base_keys` - used by
+    build_targeted_response_schema (Phase 10B, docs/phase10b-supplemental-audio.md
+    §Targeted extraction) so a supplemental call's vehicles/casualties item schema
+    only asks about the specific sub-fields that are actually eligible, not every
+    field of that module."""
+    fields_by_key = {f['field_key']: f for f in module['fields']}
+    properties, required, ordering = {}, [], []
+    for key in base_keys:
+        properties[key] = _field_wrapper_schema(fields_by_key[key])
+        required.append(key)
+        ordering.append(key)
+    return {
+        'type': 'object',
+        'properties': properties,
+        'required': required,
+        'propertyOrdering': ordering,
+        'additionalProperties': False,
+    }
+
+
+def build_targeted_response_schema(edar_schema: dict, field_keys: list[str]) -> dict:
+    """Gemini `response_json_schema` for a Phase 10B supplemental-audio call
+    (docs/phase10b-supplemental-audio.md §Targeted extraction) - covers exactly
+    `field_keys` (backend-derived, never client-supplied), not the fixed flat/
+    vehicles/casualties three-call split the normal extraction uses: a small,
+    ad-hoc, per-request schema like this is always far under Gemini's schema-
+    complexity ceiling regardless of how many fields it names, so one call is
+    enough no matter which fields are eligible.
+
+    `field_keys` may mix flat keys ("weather_at_time") and repeating-entity keys
+    ("vehicle.1.registration_number", "casualty.2.injury_severity"). Flat keys
+    become top-level properties; repeating keys are grouped into `vehicles`/
+    `casualties` arrays capped at the highest eligible index for that entity (never
+    the schema's full max_repetitions) - these entities were already identified by
+    the original extraction, so this call is only ever asked to fill in missing
+    attributes of an *existing* vehicle/casualty slot, never to discover a new one."""
+    modules_by_id = {m['module_id']: m for m in edar_schema['modules']}
+    flat_keys = [k for k in field_keys if '.' not in k]
+
+    def _repeating(entity: str) -> tuple[list[int], list[str]]:
+        indices, base_keys = set(), set()
+        for key in field_keys:
+            parts = key.split('.')
+            if len(parts) == 3 and parts[0] == entity:
+                indices.add(int(parts[1]))
+                base_keys.add(parts[2])
+        return sorted(indices), sorted(base_keys)
+
+    vehicle_indices, vehicle_base_keys = _repeating('vehicle')
+    casualty_indices, casualty_base_keys = _repeating('casualty')
+
+    properties: dict = {}
+    required: list[str] = []
+    ordering: list[str] = []
+
+    for key in flat_keys:
+        for module in edar_schema['modules']:
+            if module['repeatable']:
+                continue
+            field_def = next((f for f in module['fields'] if f['field_key'] == key), None)
+            if field_def is not None:
+                properties[key] = _field_wrapper_schema(field_def)
+                required.append(key)
+                ordering.append(key)
+                break
+
+    if vehicle_base_keys:
+        properties['vehicles'] = {
+            'type': 'array',
+            'maxItems': max(vehicle_indices),
+            'items': _partial_repeating_item_schema(modules_by_id['D'], vehicle_base_keys),
+        }
+        required.append('vehicles')
+        ordering.append('vehicles')
+
+    if casualty_base_keys:
+        properties['casualties'] = {
+            'type': 'array',
+            'maxItems': max(casualty_indices),
+            'items': _partial_repeating_item_schema(modules_by_id['E'], casualty_base_keys),
+        }
+        required.append('casualties')
+        ordering.append('casualties')
+
+    return {
+        'type': 'object',
+        'properties': properties,
+        'required': required,
+        'propertyOrdering': ordering,
+        'additionalProperties': False,
+    }
+
+
 def flat_field_keys(edar_schema: dict) -> list[str]:
     """The 28 non-repeating field keys Gemini is actually asked to extract (Module A
     minus GPS, B, C, F, G) - used by csc_apps.processing.extraction_service to know

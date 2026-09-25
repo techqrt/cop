@@ -401,3 +401,98 @@ settings (TLS, `ALLOWED_HOSTS`, CORS) remain explicitly deferred to Phase 10, no
 silently assumed solved.
 
 **Status:** Accepted.
+
+---
+
+### ADR-024 — Supplemental audio is a second Audio row on the same Recording, scoped by role and by ProcessingJob.audio, merged into the AI layer rather than replacing it
+
+**Context:** Phase 10B lets an officer send a follow-up audio for a recording
+whose AI eDAR candidate already exists, to fill in fields the original statement
+left `UNKNOWN` - without a client ever naming which fields. Before this phase,
+`Audio.recording` was a `OneToOneField` (exactly one Audio per Recording) and
+`Transcript`'s uniqueness was scoped to `(recording, language)` - both hard
+constraints assuming a Recording has exactly one audio source, ever. The existing
+STT→TRANSLATION→EXTRACTION auto-chaining (`csc_apps.processing.stt_service`/
+`translation_service`, `ProcessingJob.objects.get_or_create(recording=, job_type=)`)
+also assumed at most one job of each type per recording - reusing it verbatim for
+a second audio would have silently matched the original audio's already-SUCCEEDED
+jobs instead of creating new ones for the supplemental audio.
+
+**Decision:**
+1. **`Audio.recording` becomes a `ForeignKey`** (`related_name='audios'`), and
+   gains a **`role`** choice field (`ORIGINAL`/`SUPPLEMENTAL`, default
+   `ORIGINAL`). A Recording now has exactly one `ORIGINAL` Audio (still created
+   only at upload time, still immutable) and zero or more `SUPPLEMENTAL` ones.
+2. **`Transcript` gains an `audio` FK** (nullable only for migration simplicity -
+   every row this system writes going forward sets it), and its uniqueness
+   constraint moves from `(recording, language)` to `(audio, language)` - so each
+   Audio (original or supplemental) gets its own independent ORIGINAL/ENGLISH
+   transcript pair, rather than colliding on the recording's original pair.
+3. **`ProcessingJob` gains an `audio` FK** (nullable; unset only for `EXPORT`
+   jobs). `csc_apps.processing.stt_service`/`translation_service` now key every
+   lookup and every `get_or_create` chain call off `job.audio` instead of
+   `recording.audio`/`recording`-only queries - this is what lets a supplemental
+   audio get its own independent STT→TRANSLATION→EXTRACTION job chain without
+   touching or being confused with the original audio's already-SUCCEEDED chain.
+4. **No new job type.** A supplemental audio's extraction still runs as an
+   ordinary `job_type='EXTRACTION'` job, picked up by the same
+   `process_pending_extraction_jobs` command. `csc_apps.processing.
+   extraction_service.run_extraction_job` dispatches internally on
+   `job.audio.role`: `ORIGINAL` (or unset, for migration-era rows) runs the
+   unchanged full delete-and-replace path; `SUPPLEMENTAL` runs a new merge-only
+   path (`_run_targeted_extraction`) that (a) computes the eligible field set
+   itself, straight from the current AI `EdarFieldValue` rows'
+   `known != 'KNOWN'` - never from any client input, (b) builds a small ad-hoc
+   Gemini schema/prompt covering only that set (`build_targeted_response_schema`/
+   `build_targeted_extraction_prompt`, reusing the same `_field_wrapper_schema`
+   building blocks the normal three-call schema uses), (c) discards any field the
+   provider returns outside that set before validation ever sees it, (d) reuses
+   `csc_apps.edar.quality_validation.assess_candidate` unchanged, with
+   `expected_keys` narrowed to the eligible set, and (e) merges only the
+   resulting `KNOWN` rows into the existing AI `EdarFieldValue` rows via
+   `bulk_update` - never a delete-then-recreate, so an already-`KNOWN` AI field or
+   the `APPROVED` layer can never be touched by this path, by construction, not
+   convention.
+5. **Per-field provenance distinguishes the two paths.** A field resolved by a
+   supplemental merge gets `extraction_version` containing `targeted-v1`
+   (`csc_apps.processing.providers.gemini.prompt.TARGETED_PROMPT_VERSION`), not
+   the normal path's `v2` - while `EdarRecord.source_transcript`/`extraction_job`
+   (record-level "primary provenance" pointers) are left unchanged, still pointing
+   at the original extraction. `EdarRecord.quality_status`/`quality_report` are
+   refreshed after a merge (`_refresh_quality_summary`, reusing
+   `quality_validation.compute_metrics`) without re-running full-candidate
+   evidence-traceability validation - a merge only re-validates the fields it
+   actually resolved, never re-checks an old field's evidence against the new
+   transcript.
+6. **`RecordingView._build_detail_response` (the shared GET/PUT/approval response
+   builder) scopes every STT/translation/extraction/transcript lookup to the
+   `ORIGINAL` Audio** (`Q(audio__role='ORIGINAL') | Q(audio__isnull=True)`, the
+   `isnull` branch existing only for pre-Phase-10B rows) - so the response keeps
+   meaning exactly what it always meant (the primary pipeline's own status and
+   transcripts) once supplemental Audio/ProcessingJob/Transcript rows exist too. A
+   supplemental audio's effect is visible only through `edar.fields` - a field
+   flipping from `UNKNOWN` to `KNOWN` - never through a second, competing
+   `processingStatus`.
+7. **A supplemental job rechecks `EdarRecord.review_status` at merge time, not
+   only at upload time** (`csc_apps.processing.extraction_service.
+   _run_targeted_extraction`, plus a `select_for_update()`-locked recheck in
+   `_record_targeted_success` immediately before any write) - found and fixed in
+   post-implementation adversarial testing: the PUT endpoint's own
+   already-approved check runs when the audio is uploaded, but the job it queues
+   can run well after that with no coordination, so an officer approving the
+   record while the job is still `PENDING` (or mid-flight) was a real, reachable
+   path to silently mutating the AI layer of an already-approved record. Both
+   checks fail the job with a new non-retryable `EXTRACTION_RECORD_ALREADY_APPROVED`
+   code instead. See docs/phase10b-supplemental-audio.md §12.
+
+**Consequences:** Two ProcessingJob chains (or more, with further supplemental
+uploads) can now exist for one Recording, distinguished by `audio_id`/
+`audio.role`, sharing every provider/service/management-command/event-type this
+system already had - no `SupplementalSTTJob`/`SupplementalExtractionJob` model was
+introduced. A field's evidence is only ever validated against the transcript it
+actually came from; nothing here asserts one evidence-traceability rule across a
+merged, multi-source candidate.
+
+**Status:** Accepted.
+
+---

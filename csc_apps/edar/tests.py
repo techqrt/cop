@@ -374,3 +374,113 @@ class GeminiPromptModuleScopingTests(SimpleTestCase):
         transcript = 'the motorcycle hit the rear of the car, verbatim marker XYZ123'
         for builder in (build_flat_extraction_prompt, build_vehicles_extraction_prompt, build_casualties_extraction_prompt):
             self.assertIn(transcript, builder(transcript, schema))
+
+
+class GeminiTargetedSchemaAdapterTests(SimpleTestCase):
+    """docs/phase10b-supplemental-audio.md §Targeted extraction -
+    build_targeted_response_schema is given a backend-derived field-key subset
+    (never client-supplied) and must describe exactly that subset, nothing more
+    and nothing less, whether the subset is flat-only, repeating-only, or mixed."""
+
+    def test_flat_only_subset_has_no_vehicles_or_casualties_key(self):
+        from csc_apps.processing.providers.gemini.schema_adapter import build_targeted_response_schema
+
+        schema = load_schema()
+        response_schema = build_targeted_response_schema(schema, ['case_fir_number', 'weather_at_time_of_crash'])
+        self.assertEqual(set(response_schema['properties']), {'case_fir_number', 'weather_at_time_of_crash'})
+        self.assertEqual(set(response_schema['required']), {'case_fir_number', 'weather_at_time_of_crash'})
+
+    def test_repeating_subset_caps_maxitems_at_highest_requested_index_not_schema_max(self):
+        from csc_apps.processing.providers.gemini.schema_adapter import build_targeted_response_schema
+
+        schema = load_schema()
+        response_schema = build_targeted_response_schema(schema, ['vehicle.2.vehicle_registration_number'])
+        self.assertEqual(set(response_schema['properties']), {'vehicles'})
+        # Highest requested index is 2, not the schema's own max_repetitions (3) -
+        # this call is only ever filling in an already-identified vehicle slot,
+        # never inviting a new one.
+        self.assertEqual(response_schema['properties']['vehicles']['maxItems'], 2)
+        item_schema = response_schema['properties']['vehicles']['items']
+        self.assertEqual(set(item_schema['properties']), {'vehicle_registration_number'})
+
+    def test_mixed_flat_and_repeating_subset(self):
+        from csc_apps.processing.providers.gemini.schema_adapter import build_targeted_response_schema
+
+        schema = load_schema()
+        response_schema = build_targeted_response_schema(
+            schema, ['case_fir_number', 'vehicle.1.vehicle_registration_number', 'casualty.1.injury_severity'],
+        )
+        self.assertEqual(set(response_schema['properties']), {'case_fir_number', 'vehicles', 'casualties'})
+        self.assertEqual(
+            set(response_schema['properties']['vehicles']['items']['properties']), {'vehicle_registration_number'}
+        )
+        self.assertEqual(
+            set(response_schema['properties']['casualties']['items']['properties']), {'injury_severity'}
+        )
+
+    def test_every_targeted_field_still_has_value_confidence_evidence_wrapper(self):
+        from csc_apps.processing.providers.gemini.schema_adapter import build_targeted_response_schema
+
+        schema = load_schema()
+        response_schema = build_targeted_response_schema(schema, ['case_fir_number'])
+        wrapper = response_schema['properties']['case_fir_number']
+        self.assertEqual(set(wrapper['properties']), {'value', 'confidence', 'evidence'})
+
+    def test_targeted_schema_additional_properties_false_everywhere(self):
+        from csc_apps.processing.providers.gemini.schema_adapter import build_targeted_response_schema
+
+        schema = load_schema()
+        response_schema = build_targeted_response_schema(
+            schema, ['case_fir_number', 'vehicle.1.vehicle_registration_number'],
+        )
+        self.assertFalse(response_schema['properties']['case_fir_number']['additionalProperties'])
+        self.assertFalse(response_schema['additionalProperties'])
+        self.assertFalse(response_schema['properties']['vehicles']['items']['additionalProperties'])
+
+
+class GeminiTargetedPromptTests(SimpleTestCase):
+    """docs/phase10b-supplemental-audio.md §Targeted extraction - the targeted
+    prompt must reference only the given field keys (with their full dotted form
+    for a repeating field, so the index is visible) and must include entity
+    context only when given."""
+
+    def test_field_reference_shows_dotted_key_for_repeating_field(self):
+        from csc_apps.processing.providers.gemini.prompt import build_targeted_field_reference
+
+        schema = load_schema()
+        reference = build_targeted_field_reference(schema, ['vehicle.2.vehicle_registration_number'])
+        self.assertIn('vehicle.2.vehicle_registration_number', reference)
+
+    def test_prompt_excludes_fields_not_in_the_targeted_set(self):
+        from csc_apps.processing.providers.gemini.prompt import build_targeted_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_targeted_extraction_prompt('a transcript', schema, ['case_fir_number'])
+        self.assertIn('case_fir_number', prompt)
+        self.assertNotIn('road_name (', prompt)
+
+    def test_prompt_includes_entity_context_when_given(self):
+        from csc_apps.processing.providers.gemini.prompt import build_targeted_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_targeted_extraction_prompt(
+            'a transcript', schema, ['vehicle.1.vehicle_registration_number'],
+            entity_context_lines=['vehicle 1: vehicle_type=motorcycle'],
+        )
+        self.assertIn('vehicle 1: vehicle_type=motorcycle', prompt)
+        self.assertIn('CONTEXT', prompt)
+
+    def test_prompt_omits_context_block_when_none_given(self):
+        from csc_apps.processing.providers.gemini.prompt import build_targeted_extraction_prompt
+
+        schema = load_schema()
+        prompt = build_targeted_extraction_prompt('a transcript', schema, ['case_fir_number'])
+        self.assertNotIn('CONTEXT', prompt)
+
+    def test_prompt_includes_transcript_verbatim(self):
+        from csc_apps.processing.providers.gemini.prompt import build_targeted_extraction_prompt
+
+        schema = load_schema()
+        transcript = 'supplemental statement, verbatim marker ABC999'
+        prompt = build_targeted_extraction_prompt(transcript, schema, ['case_fir_number'])
+        self.assertIn(transcript, prompt)

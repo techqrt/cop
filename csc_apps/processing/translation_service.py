@@ -37,7 +37,7 @@ def run_translation_job(job_id: int, provider: TranslationProvider | None = None
     canonical English transcript for an already-succeeded job."""
     provider = provider or SarvamTranslationProvider()
 
-    job = ProcessingJob.objects.select_related('recording').get(job_id=job_id, job_type='TRANSLATION')
+    job = ProcessingJob.objects.select_related('recording', 'audio').get(job_id=job_id, job_type='TRANSLATION')
     if job.status not in _RUNNABLE_STATUSES:
         logger.info('translation_service.skip job_id=%s status=%s', job_id, job.status)
         return job
@@ -58,7 +58,12 @@ def run_translation_job(job_id: int, provider: TranslationProvider | None = None
     )
 
     start = time.monotonic()
-    original_transcript = Transcript.objects.filter(recording=recording, language='ORIGINAL').first()
+    # Scoped by job.audio, not just recording (Phase 10B, docs/phase10b-
+    # supplemental-audio.md §Model changes): once a recording can have more than one
+    # Audio row, `Transcript.objects.filter(recording=recording, language=...)`
+    # would be ambiguous - this job's own Audio identifies exactly which ORIGINAL
+    # transcript it must translate.
+    original_transcript = Transcript.objects.filter(audio=job.audio, language='ORIGINAL').first()
     if original_transcript is None:
         # Should not happen in practice - this job is only ever created right after
         # STT succeeds (csc_apps.processing.stt_service._record_success) - but a
@@ -129,14 +134,17 @@ def _record_failure(job: ProcessingJob, recording, error: ProviderError, duratio
 
 def _record_success(job: ProcessingJob, recording, result, duration_seconds: float) -> None:
     with transaction.atomic():
-        # unique_together on (recording, language) (docs/domain-model.md) - the same
+        # unique_together on (audio, language) (docs/domain-model.md) - the same
         # retry-safety guarantee as the original transcript: a second successful run
-        # updates the one ENGLISH-language row rather than duplicating it
-        # (docs/phase3-sarvam-translation.md §Idempotency).
+        # updates the one ENGLISH-language row for this Audio rather than
+        # duplicating it (docs/phase3-sarvam-translation.md §Idempotency). Scoped by
+        # audio, not recording, since Phase 10B (docs/phase10b-supplemental-
+        # audio.md).
         Transcript.objects.update_or_create(
-            recording=recording,
+            audio=job.audio,
             language='ENGLISH',
             defaults={
+                'recording': recording,
                 'text': result.text,
                 # detected_language_code holds the language *this row's text* is
                 # written in - target_language_code (en-IN), matching the ORIGINAL
@@ -170,10 +178,14 @@ def _record_success(job: ProcessingJob, recording, result, duration_seconds: flo
         # translation succeeding is what makes a recording eligible for eDAR
         # extraction - chain the next stage's job the same way STT succeeding
         # chained this one (csc_apps.processing.stt_service._record_success).
-        # get_or_create guards against ever creating a second EXTRACTION job for one
-        # recording, same reasoning as the STT->TRANSLATION chain.
+        # get_or_create guards against ever creating a second EXTRACTION job for the
+        # same Audio, same reasoning as the STT->TRANSLATION chain. Scoped by audio
+        # as well as recording (Phase 10B, docs/phase10b-supplemental-audio.md
+        # §Job chaining) - the extraction job this chains to is what decides
+        # (via ProcessingJob.audio.role) whether extraction_service runs a full
+        # replace or a targeted supplemental merge.
         extraction_job, created = ProcessingJob.objects.get_or_create(
-            recording=recording, job_type='EXTRACTION', defaults={'status': 'PENDING'}
+            recording=recording, job_type='EXTRACTION', audio=job.audio, defaults={'status': 'PENDING'}
         )
         if created:
             ProcessingEvent.objects.create(

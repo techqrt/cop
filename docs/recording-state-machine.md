@@ -41,7 +41,15 @@ RETRY             -> PROCESSING
 COMPLETED         -> (terminal)
 ```
 
-No other transition is valid. This table is implemented as data (not scattered `if`
+No other transition is valid — notably, **Phase 10B's supplemental-audio upload
+(`PUT /recordings/<id>/`, docs/phase10b-supplemental-audio.md) does not add a new
+transition and does not touch `Recording.status` at all.** It only runs while the
+recording is already `READY_FOR_REVIEW` or `IN_REVIEW`, and stays there regardless
+of how many eDAR fields a supplemental audio resolves — there is no distinct
+"fully complete" vs. "partially complete" ready-state in this system, so nothing
+new was needed. Officer approval (Phase 6) remains the sole path to `COMPLETED`.
+
+This table is implemented as data (not scattered `if`
 statements) in `csc_apps/recordings/state_machine.py::ALLOWED_TRANSITIONS`, with a single
 `can_transition(from_state, to_state) -> bool` / `transition(recording, to_state)` pair of
 functions — mirroring PMS's preference for small, single-responsibility functions

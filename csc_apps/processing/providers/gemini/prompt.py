@@ -14,6 +14,7 @@ any individual field or keyword - splitting the request, not shrinking what is a
 per field, is what keeps every field's confidence+evidence provenance uniform.
 """
 
+from csc_apps.edar.schema_validation import resolve_field_key
 from csc_apps.processing.providers.gemini.schema_adapter import GPS_FIELD_KEY, MAX_CASUALTIES
 
 # Bump this whenever the prompt's instructions change in a way that could affect
@@ -23,6 +24,13 @@ from csc_apps.processing.providers.gemini.schema_adapter import GPS_FIELD_KEY, M
 # produced older extractions. Bumped from v1 to v2 for the three-call split - the
 # instructions each call receives changed, even though the underlying rules did not.
 PROMPT_VERSION = 'v2'
+
+# Phase 10B's supplemental/targeted extraction (docs/phase10b-supplemental-
+# audio.md) is a distinct prompt shape (a backend-selected field subset plus
+# entity-matching context, not the fixed flat/vehicles/casualties split) - versioned
+# independently so EdarFieldValue.extraction_version always shows whether a given
+# field came from the normal or the supplemental extraction path.
+TARGETED_PROMPT_VERSION = 'targeted-v1'
 
 _ROLE_AND_TASK = """\
 You are a crash-scene information extraction system used by a police records \
@@ -92,9 +100,26 @@ not add commentary, markdown formatting, or any text outside the JSON object. Do
 add fields that are not in the schema. Never include more than {max_casualties} \
 casualties."""
 
+_TARGETED_STRUCTURED_OUTPUT_INSTRUCTION = """\
+This is a SUPPLEMENTAL follow-up statement, recorded after an earlier statement \
+about the same crash. The earlier statement already produced values for most eDAR \
+fields; the FIELD REFERENCE below lists only the specific fields that earlier \
+statement left unresolved. Extract a value for one of these fields ONLY if this new \
+transcript actually supports it - most of them may still end up null, and that is \
+expected, not a failure. If this transcript does not mention a field at all, or \
+only repeats something already recorded, leave it null rather than restating a \
+guess. Respond with structured JSON matching exactly the schema provided to you via \
+this request's response schema. Do not add commentary, markdown formatting, or any \
+text outside the JSON object. Do not add fields that are not in the schema."""
 
-def _field_reference_line(field_def: dict) -> str:
-    parts = [f"- {field_def['field_key']} ({field_def['name']}): type={field_def['data_type']}"]
+
+def _field_reference_line(field_def: dict, display_key: str | None = None) -> str:
+    # display_key lets a targeted/supplemental reference (Phase 10B) show the full
+    # dotted key ("vehicle.1.registration_number") instead of field_def's own bare
+    # base key ("registration_number") - the flat/vehicles/casualties references
+    # never pass this, so their output is unchanged.
+    key = display_key or field_def['field_key']
+    parts = [f"- {key} ({field_def['name']}): type={field_def['data_type']}"]
     if field_def.get('allowed_values_status') == 'resolved_from_source' and field_def.get('allowed_values'):
         parts.append(f"allowed values: {', '.join(field_def['allowed_values'])}")
     elif field_def['data_type'] in ('categorical', 'multi_label_categorical', 'ordinal'):
@@ -149,6 +174,53 @@ def build_vehicle_field_reference(edar_schema: dict) -> str:
         _module_reference(modules_by_id['D'])
         + '\n(one such object per vehicle, in a top-level "vehicles" array, max 3)'
     )
+
+
+def build_targeted_field_reference(edar_schema: dict, field_keys: list[str]) -> str:
+    """Field reference for a Phase 10B supplemental/targeted call (docs/phase10b-
+    supplemental-audio.md §Targeted extraction) - exactly the backend-derived
+    `field_keys`, dotted keys shown in full so a repeating field's index is visible
+    to the model (e.g. "vehicle.1.registration_number"), not just its base name."""
+    return '\n'.join(
+        _field_reference_line(resolve_field_key(key, schema=edar_schema), display_key=key) for key in field_keys
+    )
+
+
+def build_entity_context_block(context_lines: list[str]) -> str:
+    """Optional "already known" summary of the vehicles/casualties a targeted call's
+    eligible fields belong to (docs/phase10b-supplemental-audio.md §Entity
+    matching) - built by the caller (csc_apps.processing.extraction_service) from
+    already-KNOWN AI field values, not by this module (prompt.py stays free of any
+    database access). Lets Gemini correctly attribute a new statement like "the
+    car's registration was..." to the right existing vehicle index instead of
+    guessing; the instruction text makes clear this is for matching only, not
+    something to re-report."""
+    if not context_lines:
+        return ''
+    return 'CONTEXT (already recorded from an earlier statement - for matching only, do not re-report):\n' + '\n'.join(
+        context_lines
+    )
+
+
+def build_targeted_extraction_prompt(
+    english_text: str, edar_schema: dict, field_keys: list[str], entity_context_lines: list[str] | None = None,
+) -> str:
+    """The Phase 10B supplemental-audio call - one call, restricted to exactly
+    `field_keys` (docs/phase10b-supplemental-audio.md §Targeted extraction)."""
+    sections = [
+        _ROLE_AND_TASK,
+        _SOURCE_AND_NO_INVENTION_RULES,
+        'FIELD REFERENCE:\n\n' + build_targeted_field_reference(edar_schema, field_keys),
+    ]
+    context_block = build_entity_context_block(entity_context_lines or [])
+    if context_block:
+        sections.append(context_block)
+    sections.append(_TARGETED_STRUCTURED_OUTPUT_INSTRUCTION)
+    sections.append(
+        'TRANSCRIPT (the officer\'s supplemental statement, already translated to English):\n"""\n'
+        + english_text + '\n"""'
+    )
+    return '\n\n'.join(sections)
 
 
 def build_casualty_field_reference(edar_schema: dict) -> str:

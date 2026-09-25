@@ -104,7 +104,9 @@ class TranslationProvider(abc.ABC):
 
 class ExtractionProvider(abc.ABC):
     @abc.abstractmethod
-    def extract(self, english_text: str, schema: dict) -> ExtractionResult:
+    def extract(
+        self, english_text: str, schema: dict, target_fields: list[str] | None = None
+    ) -> ExtractionResult:
         """`schema` is the parsed contents of schemas/edar-schema.json
         (docs/ai-extraction-contract.md §1). `english_text` is the persisted
         Transcript(language=ENGLISH) text - never the original-language transcript
@@ -117,6 +119,15 @@ class ExtractionProvider(abc.ABC):
         reconciling this against the full expected field-key set and persisting the
         rest as `known=UNKNOWN` (docs/unknown-data-policy.md) - that reconciliation
         is a schema/persistence concern, not something a provider should decide.
+
+        `target_fields` (Phase 10B, docs/phase10b-supplemental-audio.md
+        §Targeted extraction): when given, restricts extraction to exactly this
+        field-key subset (used for supplemental-audio processing, where the caller
+        has already determined which fields are still unresolved) - `None` (the
+        default) means "extract every field this provider normally asks about",
+        unchanged from before Phase 10B. A provider implementation is free to
+        return fields outside `target_fields` (untrusted output) - the caller
+        enforces the restriction, not the provider.
 
         Raises ProviderError on failure; the caller classifies it via
         csc_apps.processing.error_classification, not this method."""

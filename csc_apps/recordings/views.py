@@ -1,6 +1,7 @@
 import datetime as dt
 
 from django.core.paginator import Paginator
+from django.db.models import Q
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
@@ -19,6 +20,7 @@ from csc_apps.recordings.dataclasses.request.export_edar import ExportEdarReques
 from csc_apps.recordings.dataclasses.request.get_all_recordings import GetAllRecordingsRequest
 from csc_apps.recordings.dataclasses.request.get_recording import GetRecordingRequest
 from csc_apps.recordings.dataclasses.request.list_recordings import ListRecordingsRequest
+from csc_apps.recordings.dataclasses.request.supplement_audio import SupplementAudioRequest
 from csc_apps.recordings.dataclasses.request.upload_recording import UploadRecordingRequest
 from csc_apps.recordings.models.audio import Audio, Transcript
 from csc_apps.recordings.models.recording import Recording
@@ -97,6 +99,7 @@ class RecordingView:
             try:
                 audio = Audio.objects.create(
                     recording=recording,
+                    role='ORIGINAL',
                     source='UPLOAD',
                     storage_path=stored.storage_path,
                     content_type=params.audio.content_type,
@@ -117,7 +120,9 @@ class RecordingView:
                 # (docs/processing-pipeline.md §3, Sarvam integration is Phase 2), so
                 # there is nothing meaningful to execute. Creating this row is the
                 # "scheduling" Phase 1 is responsible for.
-                job = ProcessingJob.objects.create(recording=recording, job_type='STT', status='PENDING')
+                job = ProcessingJob.objects.create(
+                    recording=recording, job_type='STT', audio=audio, status='PENDING'
+                )
                 ProcessingEvent.objects.create(
                     recording=recording,
                     job=job,
@@ -344,6 +349,102 @@ class RecordingView:
 
         return self._build_detail_response(recording)
 
+    @Common(response_handler=RecordingDetailResponseSerializer).exception_handler
+    def supplement_extract(self, params: SupplementAudioRequest, recording_id: int) -> Response:
+        """PUT /recordings/<id>/ - targeted supplemental audio for missing eDAR
+        fields only (docs/phase10b-supplemental-audio.md). Accepts audio ONLY - no
+        `fields`/`target_fields`/`missing_fields` parameter of any kind; which eDAR
+        fields this audio can help resolve is determined entirely from the
+        recording's own current AI eDAR state (csc_apps.processing.
+        extraction_service._run_targeted_extraction reads it fresh at merge time),
+        never from anything the client sends. Rejected up front, before any audio
+        is stored, if every eDAR field is already known - repeated supplemental
+        uploads are otherwise supported without limit, each accumulating whatever
+        fields the previous ones left unresolved. Mirrors the original upload's
+        async pattern exactly (docs/phase1-audio-ingestion.md): this only stores
+        the audio and queues a PENDING STT ProcessingJob, it never runs STT,
+        translation, or extraction synchronously, and never transitions
+        Recording.status - the officer review/approval workflow (Phase 6) remains
+        the sole path to COMPLETED regardless of how many fields are still
+        unresolved. The response is the exact same shape GET returns."""
+        requesting_user = User.objects.get(user_id=params.user_id)
+        recording = self._get_authorized_recording(requesting_user, recording_id)
+
+        if recording.status not in ('READY_FOR_REVIEW', 'IN_REVIEW'):
+            raise ValueError(
+                'Supplemental audio requires a recording with a completed AI eDAR extraction that has '
+                'not yet been approved'
+            )
+
+        edar_record = EdarRecord.objects.filter(recording=recording).first()
+        if edar_record is None:
+            raise ValueError('No AI eDAR candidate exists for this recording')
+        if edar_record.review_status == 'APPROVED':
+            raise ValueError('This recording has already been approved; supplemental audio is no longer accepted')
+
+        eligible_field_count = (
+            EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI').exclude(known='KNOWN').count()
+        )
+        if eligible_field_count == 0:
+            raise ValueError('Every eDAR field is already known for this recording; no supplemental audio is needed')
+
+        validated = validate_audio_upload(params.audio)
+
+        with transaction.atomic():
+            storage = get_storage()
+            stored = storage.save(
+                recording_id=recording.recording_id, extension=validated.extension, fileobj=params.audio
+            )
+            try:
+                audio = Audio.objects.create(
+                    recording=recording,
+                    role='SUPPLEMENTAL',
+                    source='UPLOAD',
+                    storage_path=stored.storage_path,
+                    content_type=params.audio.content_type,
+                    original_filename=validated.original_filename,
+                    file_size_bytes=stored.size_bytes,
+                    checksum_sha256=stored.checksum_sha256,
+                )
+                ProcessingEvent.objects.create(
+                    recording=recording,
+                    event_type=event_types.AUDIO_VALIDATED,
+                    metadata={
+                        'content_type': params.audio.content_type, 'declared_size_bytes': params.audio.size,
+                        'role': 'SUPPLEMENTAL',
+                    },
+                )
+                ProcessingEvent.objects.create(
+                    recording=recording,
+                    event_type=event_types.AUDIO_STORED,
+                    metadata={'audio_id': audio.audio_id, 'size_bytes': stored.size_bytes, 'role': 'SUPPLEMENTAL'},
+                )
+
+                job = ProcessingJob.objects.create(
+                    recording=recording, job_type='STT', audio=audio, status='PENDING'
+                )
+                ProcessingEvent.objects.create(
+                    recording=recording,
+                    job=job,
+                    event_type=event_types.PROCESSING_JOB_CREATED,
+                    metadata={'job_type': job.job_type, 'role': 'SUPPLEMENTAL'},
+                )
+
+                ActivityLog.record(
+                    user=requesting_user,
+                    action='Create',
+                    model='Audio',
+                    details={
+                        'recording_id': recording.recording_id, 'audio_id': audio.audio_id, 'role': 'SUPPLEMENTAL',
+                        'eligible_field_count': eligible_field_count,
+                    },
+                )
+            except Exception:
+                storage.delete(stored.storage_path)
+                raise
+
+        return self._build_detail_response(recording)
+
     @Common(response_handler=RecordingExportResponseSerializer).exception_handler
     def export_edar_extract(self, params: ExportEdarRequest, recording_id: int) -> Response:
         """Phase 8 export (docs/phase8-export.md). Read-only, same authorization as
@@ -406,35 +507,63 @@ class RecordingView:
         the exact same recording-detail shape (docs/phase6-officer-review-
         approval.md §Response design: no new response format), so approval simply
         reads back the state GET would show immediately afterward, now with
-        `edar.reviewStatus`/`edar.approved` populated."""
-        stt_job = ProcessingJob.objects.filter(recording=recording, job_type='STT').order_by('-created_at').first()
+        `edar.reviewStatus`/`edar.approved` populated.
+
+        Every lookup below is scoped to the recording's ORIGINAL Audio (Phase 10B,
+        docs/phase10b-supplemental-audio.md §Response representation unchanged) -
+        a Recording can now have supplemental Audio/ProcessingJob/Transcript rows
+        too, and this response must keep meaning exactly what it always meant
+        (the primary upload's own pipeline status and transcripts), not be
+        overwritten by whichever audio was processed most recently. A supplemental
+        audio's effect is only ever visible here through `edar.fields` - a field
+        that was UNKNOWN flips to KNOWN once a supplemental merge resolves it -
+        never through a second/competing processingStatus.
+
+        `Q(audio__isnull=True)` is included alongside `audio__role='ORIGINAL'`
+        (rather than requiring `audio__role='ORIGINAL'` alone) purely for rows that
+        predate Phase 10B's `ProcessingJob.audio`/`Transcript.audio` fields - every
+        row this system creates going forward always sets `audio`, so in practice
+        this only ever matches historical data, never a real ambiguity between an
+        original and a supplemental job/transcript."""
+        _original_audio_q = Q(audio__isnull=True) | Q(audio__role='ORIGINAL')
+
+        stt_job = (
+            ProcessingJob.objects.filter(_original_audio_q, recording=recording, job_type='STT')
+            .order_by('-created_at').first()
+        )
         processing_status = stt_job.status if stt_job else 'PENDING'
 
         original_data = None
         stt_failure_reason = None
         if processing_status == 'SUCCEEDED':
-            original_row = Transcript.objects.filter(recording=recording, language='ORIGINAL').first()
+            original_row = Transcript.objects.filter(
+                _original_audio_q, recording=recording, language='ORIGINAL'
+            ).first()
             if original_row is not None:
                 original_data = {'text': original_row.text, 'language': original_row.detected_language_code}
         elif processing_status == 'FAILED':
             stt_failure_reason = stt_job.error_code
 
         translation_job = (
-            ProcessingJob.objects.filter(recording=recording, job_type='TRANSLATION').order_by('-created_at').first()
+            ProcessingJob.objects.filter(_original_audio_q, recording=recording, job_type='TRANSLATION')
+            .order_by('-created_at').first()
         )
         translation_status = translation_job.status if translation_job else None
 
         english_data = None
         translation_failure_reason = None
         if translation_status == 'SUCCEEDED':
-            english_row = Transcript.objects.filter(recording=recording, language='ENGLISH').first()
+            english_row = Transcript.objects.filter(
+                _original_audio_q, recording=recording, language='ENGLISH'
+            ).first()
             if english_row is not None:
                 english_data = {'text': english_row.text, 'language': english_row.detected_language_code}
         elif translation_status == 'FAILED':
             translation_failure_reason = translation_job.error_code
 
         extraction_job = (
-            ProcessingJob.objects.filter(recording=recording, job_type='EXTRACTION').order_by('-created_at').first()
+            ProcessingJob.objects.filter(_original_audio_q, recording=recording, job_type='EXTRACTION')
+            .order_by('-created_at').first()
         )
         extraction_status = extraction_job.status if extraction_job else None
 

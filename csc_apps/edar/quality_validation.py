@@ -140,7 +140,7 @@ def assess_candidate(
         warnings.extend(_cross_field_warnings(valid_entries, vehicle_count, casualty_count))
 
     rows = _build_rows(expected_keys, valid_entries) if not errors else []
-    metrics = _metrics(rows, valid_entries, schema, warnings, errors)
+    metrics = compute_metrics(rows, schema, warnings, errors)
     status = STATUS_INVALID if errors else (STATUS_VALIDATION_WARNING if warnings else STATUS_VALIDATED)
     report = {
         'status': status,
@@ -223,10 +223,19 @@ def _build_rows(expected_keys: list[str], valid_entries: dict[str, dict]) -> lis
     return rows
 
 
-def _metrics(rows: list[dict], entries: dict[str, dict], schema: dict, warnings: list, errors: list) -> dict:
+def compute_metrics(rows: list[dict], schema: dict, warnings: list, errors: list) -> dict:
     """Deterministic counts only. `fieldCoverageRatio` is COVERAGE (share of attempted
     fields the transcript supported) - explicitly not accuracy or correctness, and
-    there is deliberately no aggregate accuracy/confidence score anywhere."""
+    there is deliberately no aggregate accuracy/confidence score anywhere.
+
+    Public (not assess_candidate-only) since Phase 10B's supplemental-extraction
+    merge (csc_apps.processing.extraction_service) also needs to recompute this
+    summary for an EdarRecord's full current AI row set after a targeted merge,
+    without re-running the whole candidate-validation pipeline (docs/phase10b-
+    supplemental-audio.md §Quality summary refresh). `rows` here only needs
+    `field_key`/`known`/`confidence`/`source_transcript_segment` per item - the same
+    shape assess_candidate's own `_build_rows` produces, or a `.values(...)`
+    projection of EdarFieldValue rows."""
     known = [r for r in rows if r['known'] == 'KNOWN']
     warned_untraceable = {w['field'] for w in warnings if w['code'] == 'evidence_not_traceable'}
     with_evidence = [r for r in known if r['source_transcript_segment']]

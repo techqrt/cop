@@ -10,9 +10,9 @@ Conceptual entities first, then the Phase 0 relational shape actually implemente
 |---|---|
 | User | An authenticated person: Officer, Reviewer, or Admin (`docs/security-baseline.md`). |
 | Recording | One crash-report capture session: the container for an Audio, its Transcripts, its ProcessingJobs, and its EdarRecord. Owns the lifecycle state (`docs/recording-state-machine.md`) and the device-captured GPS. |
-| Audio | The raw evidence file (Layer 1) — immutable once stored (ADR-002). |
-| Transcript | Text produced from Audio: `language = ORIGINAL \| ENGLISH`. The English one is always derived from the original via translation (ADR-004), never transcribed independently. |
-| ProcessingJob | One asynchronous unit of pipeline work (`job_type = STT \| TRANSLATION \| EXTRACTION \| EXPORT`) with retry/failure state (`docs/error-retry-strategy.md`). |
+| Audio | A raw evidence file (Layer 1) — immutable once stored (ADR-002). One `ORIGINAL` per Recording plus zero or more `SUPPLEMENTAL` follow-ups (ADR-024, Phase 10B). |
+| Transcript | Text produced from one Audio: `language = ORIGINAL \| ENGLISH`. The English one is always derived from the original via translation (ADR-004), never transcribed independently. Each Audio (original or supplemental) has its own pair. |
+| ProcessingJob | One asynchronous unit of pipeline work (`job_type = STT \| TRANSLATION \| EXTRACTION \| EXPORT`) for one Audio, with retry/failure state (`docs/error-retry-strategy.md`). |
 | ProcessingEvent | An immutable timeline entry for a Recording's pipeline (`docs/observability.md`) — distinct from PMS's CRUD-oriented `ActivityLog`. |
 | EdarRecord | The header row for one Recording's eDAR data: one-to-one with Recording, carries only the record-level review/approval state. |
 | EdarFieldValue | One value for one eDAR field, one layer (`AI` or `APPROVED`) — see ADR-011. This is where all 42 fields, and every Vehicle/Casualty repetition, actually live. |
@@ -64,21 +64,27 @@ Recording (csc_apps/recordings)
   created_at, updated_at
 
 Audio (csc_apps/recordings)
-  audio_id PK, recording FK -> Recording (PROTECT, one-to-one)
+  audio_id PK, recording FK -> Recording (PROTECT)
+  role              [ORIGINAL|SUPPLEMENTAL]  (default ORIGINAL)
   source            [LIVE|UPLOAD]
   storage_path, content_type, original_filename, duration_seconds, file_size_bytes,
   checksum_sha256 (indexed - Phase 1 duplicate-submission lookup, docs/open-decisions.md
   OD-011), uploaded_at
   # original_filename added in Phase 1 (docs/phase1-audio-ingestion.md §5) - display/
   # audit metadata only, never used to build storage_path.
+  # `recording` changed from a one-to-one FK to a plain FK, and `role` was added, in
+  # Phase 10B (docs/phase10b-supplemental-audio.md, ADR-024): a Recording now has
+  # exactly one ORIGINAL Audio (unchanged identity/immutability, ADR-002) plus zero
+  # or more SUPPLEMENTAL ones, each a later targeted follow-up recording used only
+  # to fill in eDAR fields the original left UNKNOWN.
 
 Transcript (csc_apps/recordings)
-  transcript_id PK, recording FK -> Recording (PROTECT)
+  transcript_id PK, recording FK -> Recording (PROTECT), audio FK -> Audio (nullable, PROTECT)
   language          [ORIGINAL|ENGLISH]
   text, detected_language_code (the language *this row's text* is written in - see
   note below), provider_name, provider_metadata (JSON)
   created_at
-  unique_together: (recording, language)
+  unique_together: (audio, language)
   # Phase 2 (docs/phase2-sarvam-stt.md §6): ORIGINAL rows are actively written by
   # csc_apps.processing.stt_service. Phase 3 (docs/phase3-sarvam-translation.md §9):
   # ENGLISH rows are actively written by csc_apps.processing.translation_service.
@@ -87,15 +93,26 @@ Transcript (csc_apps/recordings)
   # guarantee (ADR-004). Note: an ENGLISH row's detected_language_code is "en-IN"
   # (the language of its own text), not the language it was translated from - that
   # provenance lives in provider_metadata.source_language_code instead.
+  # Phase 10B (docs/phase10b-supplemental-audio.md, ADR-024): `audio` was added and
+  # the uniqueness constraint moved from (recording, language) to (audio, language)
+  # - each Audio (original or supplemental) now gets its own independent ORIGINAL/
+  # ENGLISH transcript pair, rather than every Audio on a Recording colliding on
+  # one shared pair. Nullable only for migration simplicity; every row written since
+  # Phase 10B sets it.
 
 ProcessingJob (csc_apps/processing)
-  job_id PK, recording FK -> Recording (PROTECT)
+  job_id PK, recording FK -> Recording (PROTECT), audio FK -> Audio (nullable, PROTECT)
   job_type          [STT|TRANSLATION|EXTRACTION|EXPORT]
   status            [PENDING|RUNNING|SUCCEEDED|FAILED|RETRYING]
   attempt_count, max_attempts
   is_retryable, error_code, error_message           (docs/error-retry-strategy.md)
   provider_name, provider_metadata (JSON)
   started_at, completed_at, created_at
+  # `audio` added in Phase 10B (docs/phase10b-supplemental-audio.md, ADR-024) - null
+  # only for EXPORT jobs; every STT/TRANSLATION/EXTRACTION job sets it, and it is
+  # what lets one Recording have more than one independent job chain (one per
+  # Audio). csc_apps.processing.extraction_service dispatches a full-replace vs.
+  # merge-only extraction based on job.audio.role, not a second job_type.
 
 ProcessingEvent (csc_apps/processing)
   event_id PK, recording FK -> Recording (PROTECT), job FK -> ProcessingJob (nullable, PROTECT)

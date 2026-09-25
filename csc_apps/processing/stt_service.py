@@ -38,13 +38,19 @@ def run_stt_job(job_id: int, provider: SpeechToTextProvider | None = None) -> Pr
     """
     provider = provider or SarvamSpeechToTextProvider()
 
-    job = ProcessingJob.objects.select_related('recording').get(job_id=job_id, job_type='STT')
+    job = ProcessingJob.objects.select_related('recording', 'audio').get(job_id=job_id, job_type='STT')
     if job.status not in _RUNNABLE_STATUSES:
         logger.info('stt_service.skip job_id=%s status=%s', job_id, job.status)
         return job
 
     recording = job.recording
-    audio = recording.audio
+    # job.audio, not recording.audio (Phase 10B, docs/phase10b-supplemental-audio.md
+    # §Model changes): a Recording can now have more than one Audio row (its
+    # original upload plus zero or more supplemental ones), so which Audio this job
+    # transcribes is only known from the job itself, not inferred from the
+    # recording. Every STT job created since Phase 10B (both the original upload's
+    # and a supplemental one's) sets this.
+    audio = job.audio
 
     job.status = 'RUNNING'
     job.attempt_count += 1
@@ -112,15 +118,20 @@ def _record_failure(job: ProcessingJob, recording, error: ProviderError, duratio
 
 
 def _record_success(job: ProcessingJob, recording, result, duration_seconds: float) -> None:
+    audio = job.audio
     with transaction.atomic():
-        # unique_together on (recording, language) - see docs/domain-model.md - makes
-        # this the retry-safety/idempotency guarantee: a second successful run for the
-        # same recording updates the one ORIGINAL-language row rather than duplicating
-        # it (docs/phase2-sarvam-stt.md §Retry safety, §Idempotency).
+        # unique_together on (audio, language) - see docs/domain-model.md - makes
+        # this the retry-safety/idempotency guarantee: a second successful run for
+        # the same Audio row updates the one ORIGINAL-language row rather than
+        # duplicating it (docs/phase2-sarvam-stt.md §Retry safety, §Idempotency).
+        # Scoped by audio, not recording, since Phase 10B (docs/phase10b-
+        # supplemental-audio.md): each Audio (original or supplemental) gets its own
+        # ORIGINAL/ENGLISH transcript pair.
         Transcript.objects.update_or_create(
-            recording=recording,
+            audio=audio,
             language='ORIGINAL',
             defaults={
+                'recording': recording,
                 'text': result.text,
                 'detected_language_code': result.detected_language_code,
                 'provider_name': result.provider_name,
@@ -142,12 +153,17 @@ def _record_success(job: ProcessingJob, recording, result, duration_seconds: flo
         # Phase 3 (docs/phase3-sarvam-translation.md §Architecture): STT succeeding is
         # what makes a recording eligible for translation - chain the next stage's
         # job the same way Phase 1's upload created this STT job. get_or_create
-        # guards against ever creating a second TRANSLATION job for one recording,
+        # guards against ever creating a second TRANSLATION job for the same Audio,
         # even if _record_success were somehow invoked more than once (it isn't, in
         # practice - run_stt_job's PENDING/RETRYING guard prevents that - but this
         # keeps the guarantee true by construction, not just by the caller's care).
+        # Scoped by audio as well as recording (Phase 10B, docs/phase10b-
+        # supplemental-audio.md §Job chaining) - without this, a supplemental
+        # audio's STT success would match the original audio's already-SUCCEEDED
+        # TRANSLATION job via get_or_create and silently reuse it instead of
+        # chaining a new one for the supplemental transcript.
         translation_job, created = ProcessingJob.objects.get_or_create(
-            recording=recording, job_type='TRANSLATION', defaults={'status': 'PENDING'}
+            recording=recording, job_type='TRANSLATION', audio=audio, defaults={'status': 'PENDING'}
         )
         if created:
             ProcessingEvent.objects.create(

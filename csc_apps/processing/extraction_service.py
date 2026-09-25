@@ -19,7 +19,14 @@ from django.utils import timezone
 from csc_apps.activity_log.models import ActivityLog
 from csc_apps.edar.models import EdarFieldValue, EdarRecord
 from csc_apps.edar.schema_loader import load_schema
-from csc_apps.edar.quality_validation import STATUS_INVALID, assess_candidate
+from csc_apps.edar.quality_validation import (
+    EVIDENCE_MATCH_RULE,
+    STATUS_INVALID,
+    STATUS_VALIDATED,
+    STATUS_VALIDATION_WARNING,
+    assess_candidate,
+    compute_metrics,
+)
 from csc_apps.processing import event_types
 from csc_apps.processing.error_classification import is_retryable
 from csc_apps.processing.models import ProcessingEvent, ProcessingJob
@@ -40,7 +47,7 @@ def run_extraction_job(job_id: int, provider: ExtractionProvider | None = None) 
     RETRYING is returned unchanged."""
     provider = provider or GeminiExtractionProvider()
 
-    job = ProcessingJob.objects.select_related('recording').get(job_id=job_id, job_type='EXTRACTION')
+    job = ProcessingJob.objects.select_related('recording', 'audio').get(job_id=job_id, job_type='EXTRACTION')
     if job.status not in _RUNNABLE_STATUSES:
         logger.info('extraction_service.skip job_id=%s status=%s', job_id, job.status)
         return job
@@ -61,7 +68,22 @@ def run_extraction_job(job_id: int, provider: ExtractionProvider | None = None) 
     )
 
     start = time.monotonic()
-    english_transcript = Transcript.objects.filter(recording=recording, language='ENGLISH').first()
+
+    # Phase 10B (docs/phase10b-supplemental-audio.md §Job dispatch): a targeted,
+    # merge-only extraction for a supplemental audio takes a completely different
+    # path from here on - it never deletes or replaces the AI layer, only fills in
+    # currently-unknown fields. Dispatched on job.audio.role, not a new job_type -
+    # process_pending_extraction_jobs and every other piece of ProcessingJob/
+    # ProcessingEvent machinery around this call is unchanged and reused as-is
+    # (docs/phase10b-supplemental-audio.md §Reuse, not duplication).
+    if job.audio is not None and job.audio.role == 'SUPPLEMENTAL':
+        return _run_targeted_extraction(job, recording, provider, start)
+
+    # job.audio, not recording.audio (Phase 10B, docs/phase10b-supplemental-
+    # audio.md §Model changes): a Recording can now have more than one Audio row,
+    # so which English transcript this job must extract from is only known from
+    # the job itself.
+    english_transcript = Transcript.objects.filter(audio=job.audio, language='ENGLISH').first()
     if english_transcript is None:
         # Should not happen in practice - this job is only ever created right after
         # translation succeeds (csc_apps.processing.translation_service.
@@ -169,6 +191,284 @@ def _assess(result, schema: dict, transcript_text: str):
 def _module_max(schema: dict, entity: str) -> int:
     module = next(m for m in schema['modules'] if m.get('repeat_entity') == entity)
     return module.get('max_repetitions') or 0
+
+
+def _run_targeted_extraction(
+    job: ProcessingJob, recording, provider: ExtractionProvider, start: float
+) -> ProcessingJob:
+    """Phase 10B supplemental-audio extraction (docs/phase10b-supplemental-
+    audio.md §Targeted extraction, §Merge). Reuses run_extraction_job's English-
+    transcript-lookup pattern, the same ExtractionProvider, and
+    quality_validation.assess_candidate unchanged - only the schema scope (backend-
+    derived eligible fields, never client-supplied) and the persistence step (merge
+    into existing AI rows, never delete-then-replace) differ from the path above."""
+    audio = job.audio
+    english_transcript = Transcript.objects.filter(audio=audio, language='ENGLISH').first()
+    if english_transcript is None:
+        _record_failure(
+            job, recording, ProviderError('EXTRACTION_UNSUPPORTED_INPUT', 'No English transcript found'),
+            duration_seconds=time.monotonic() - start,
+        )
+        return job
+
+    edar_record = EdarRecord.objects.filter(recording=recording).first()
+    if edar_record is None:
+        _record_failure(
+            job, recording,
+            ProviderError('EXTRACTION_UNSUPPORTED_INPUT', 'No existing AI eDAR candidate to supplement'),
+            duration_seconds=time.monotonic() - start,
+        )
+        return job
+
+    # The PUT endpoint (csc_apps.recordings.views.RecordingView.supplement_extract)
+    # already refuses a new supplemental upload once review_status is APPROVED -
+    # but that check runs at upload time, and this job may not run until well
+    # after that (it is picked up by process_pending_extraction_jobs on its own
+    # schedule, with no coordination with approval). An officer approving the
+    # record while this job sits PENDING is a real, reachable race, not a
+    # hypothetical one - rechecked here, fresh, and again immediately before the
+    # merge commits in _record_targeted_success (docs/phase10b-supplemental-
+    # audio.md §Race safety).
+    if edar_record.review_status == 'APPROVED':
+        _record_failure(
+            job, recording,
+            ProviderError(
+                'EXTRACTION_RECORD_ALREADY_APPROVED',
+                'This eDAR record was approved after this supplemental job was queued',
+            ),
+            duration_seconds=time.monotonic() - start,
+        )
+        return job
+
+    schema = load_schema()
+    ai_rows = list(EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI'))
+    # Recomputed fresh here, not trusted from request time (docs/phase10b-
+    # supplemental-audio.md §Race safety) - another supplemental request may have
+    # resolved some or all of these fields between this job's creation and now.
+    eligible_keys = [r.field_key for r in ai_rows if r.known != 'KNOWN']
+
+    if not eligible_keys:
+        # Zero eligible fields left is a valid, non-error outcome, not a failure -
+        # the job still succeeds, it just resolves nothing (docs/phase10b-
+        # supplemental-audio.md §No-fabrication / zero-resolved outcome).
+        _record_targeted_success(
+            job, recording, edar_record, resolved_rows=[], requested_field_count=0,
+            duration_seconds=time.monotonic() - start,
+        )
+        return job
+
+    vehicle_count = _max_entity_index(ai_rows, 'vehicle')
+    casualty_count = _max_entity_index(ai_rows, 'casualty')
+    entity_context_lines = _entity_context_lines(ai_rows)
+
+    try:
+        result = provider.extract(
+            english_text=english_transcript.text, schema=schema, target_fields=eligible_keys,
+            entity_context_lines=entity_context_lines,
+        )
+    except ProviderError as e:
+        _record_failure(job, recording, e, duration_seconds=time.monotonic() - start)
+        return job
+
+    # Hard server-side enforcement boundary (docs/phase10b-supplemental-audio.md
+    # §Server-side enforcement): even if the provider returns a field outside what
+    # was actually asked for, it is discarded here before validation ever sees it -
+    # never persisted, never allowed to expand write scope beyond eligible_keys.
+    result.fields = [f for f in result.fields if f.field in eligible_keys]
+
+    entries = [_entry_from_extracted_field(f) for f in result.fields]
+    assessment = assess_candidate(
+        entries=entries, expected_keys=eligible_keys, transcript_text=english_transcript.text,
+        schema=schema, vehicle_count=vehicle_count, casualty_count=casualty_count,
+    )
+    report = assessment.report
+    if report['status'] == STATUS_INVALID:
+        ProcessingEvent.objects.create(
+            recording=recording, job=job, event_type=event_types.QUALITY_VALIDATION_FAILED,
+            metadata={'errorCount': report['metrics']['errorCount'], 'issues': report['errors']},
+        )
+        _record_failure(
+            job, recording,
+            ProviderError('EXTRACTION_SCHEMA_VALIDATION_FAILED', f'{len(report["errors"])} validation error(s)'),
+            duration_seconds=time.monotonic() - start, report=report,
+        )
+        return job
+
+    ProcessingEvent.objects.create(
+        recording=recording, job=job, event_type=event_types.QUALITY_VALIDATION_SUCCEEDED,
+        metadata={
+            'status': report['status'], 'warningCount': report['metrics']['warningCount'],
+            'knownFields': report['metrics']['knownFields'],
+        },
+    )
+
+    resolved_rows = [r for r in assessment.rows if r['known'] == 'KNOWN']
+    _record_targeted_success(
+        job, recording, edar_record, resolved_rows=resolved_rows, requested_field_count=len(eligible_keys),
+        duration_seconds=time.monotonic() - start, extraction_version=result.extraction_version,
+        targeted_warnings=report['warnings'],
+    )
+    return job
+
+
+def _max_entity_index(ai_rows: list, entity: str) -> int:
+    """Highest vehicle/casualty index with at least one AI row - the entity-count
+    context a targeted call's quality_validation._check_entity_limit needs, derived
+    from what the original extraction already established rather than re-declared
+    by anyone (docs/phase10b-supplemental-audio.md §Entity matching)."""
+    indices = {int(row.field_key.split('.')[1]) for row in ai_rows if row.field_key.startswith(f'{entity}.')}
+    return max(indices) if indices else 0
+
+
+def _entity_context_lines(ai_rows: list) -> list[str]:
+    """Human-readable "vehicle 1: ..." / "casualty 2: ..." lines built from every
+    currently-KNOWN AI field of a repeating entity - passed to the targeted prompt
+    so Gemini can match new information in the supplemental audio to the right
+    existing index (docs/phase10b-supplemental-audio.md §Entity matching). Never
+    includes a flat (non-repeating) field or a still-UNKNOWN one (nothing to
+    summarize)."""
+    by_entity_index: dict[tuple[str, int], dict[str, object]] = {}
+    for row in ai_rows:
+        if row.known != 'KNOWN':
+            continue
+        parts = row.field_key.split('.')
+        if len(parts) != 3:
+            continue
+        entity, index_str, base_key = parts
+        by_entity_index.setdefault((entity, int(index_str)), {})[base_key] = row.value
+
+    lines = []
+    for (entity, index), values in sorted(by_entity_index.items()):
+        summary = ', '.join(f'{k}={v}' for k, v in sorted(values.items()))
+        lines.append(f'{entity} {index}: {summary}')
+    return lines
+
+
+def _record_targeted_success(
+    job: ProcessingJob, recording, edar_record, resolved_rows: list[dict], requested_field_count: int,
+    duration_seconds: float, extraction_version: str | None = None, targeted_warnings: list[dict] | None = None,
+) -> None:
+    with transaction.atomic():
+        # Second, narrower half of the approval race guard (see the caller's own
+        # check): locks the EdarRecord row and re-reads review_status immediately
+        # before merging anything, closing the window between the caller's check
+        # and this commit (e.g. the time spent inside the provider.extract() call
+        # above). Under Postgres this also serializes against a concurrent
+        # approve_edar() write to the same row; under SQLite select_for_update()
+        # is a no-op (Django's own documented behavior), so this narrower half is
+        # correctness-under-Postgres only - the caller's earlier check is what
+        # covers the realistic case regardless of database engine.
+        locked_edar_record = EdarRecord.objects.select_for_update().get(pk=edar_record.pk)
+        if locked_edar_record.review_status == 'APPROVED':
+            _record_failure(
+                job, recording,
+                ProviderError(
+                    'EXTRACTION_RECORD_ALREADY_APPROVED',
+                    'This eDAR record was approved while this supplemental job was running',
+                ),
+                duration_seconds=duration_seconds,
+            )
+            return
+
+        resolved_keys: list[str] = []
+        if resolved_rows:
+            # Merge only - never a delete-then-replace of the AI layer (docs/
+            # phase10b-supplemental-audio.md §Already-KNOWN protection): every
+            # already-KNOWN AI field, and every field outside this call's eligible
+            # set entirely, is left byte-unchanged. select_for_update plus a fresh
+            # known != 'KNOWN' recheck protects against a race with a concurrent
+            # supplemental request that targeted an overlapping field and committed
+            # first - this merge then only applies to whatever is still unresolved
+            # at commit time.
+            rows_by_key = {
+                v.field_key: v for v in EdarFieldValue.objects.select_for_update().filter(
+                    edar_record=edar_record, layer='AI', field_key__in=[r['field_key'] for r in resolved_rows],
+                )
+            }
+            to_update = []
+            for row in resolved_rows:
+                field_value = rows_by_key.get(row['field_key'])
+                if field_value is None or field_value.known == 'KNOWN':
+                    continue
+                field_value.known = row['known']
+                field_value.value = row['value']
+                field_value.confidence = row['confidence']
+                field_value.source_transcript_segment = row['source_transcript_segment']
+                field_value.source_start_time = row['source_start_time']
+                field_value.source_end_time = row['source_end_time']
+                field_value.extraction_version = extraction_version
+                to_update.append(field_value)
+            if to_update:
+                EdarFieldValue.objects.bulk_update(
+                    to_update,
+                    ['known', 'value', 'confidence', 'source_transcript_segment', 'source_start_time',
+                     'source_end_time', 'extraction_version'],
+                )
+            resolved_keys = [fv.field_key for fv in to_update]
+            _refresh_quality_summary(edar_record, resolved_keys, targeted_warnings or [])
+
+        job.status = 'SUCCEEDED'
+        job.completed_at = timezone.now()
+        job.provider_metadata = {}
+        job.save(update_fields=['status', 'completed_at', 'provider_metadata'])
+
+        ProcessingEvent.objects.create(
+            recording=recording, job=job, event_type=event_types.EXTRACTION_SUCCEEDED,
+            metadata={
+                'mode': 'supplemental',
+                'audio_id': job.audio_id,
+                'requested_field_count': requested_field_count,
+                'resolved_field_count': len(resolved_keys),
+                'resolved_field_keys': resolved_keys,
+                'duration_seconds': round(duration_seconds, 2),
+            },
+        )
+        ActivityLog.record(
+            user=recording.officer, action='Update', model='EdarRecord',
+            details={
+                'recording_id': recording.recording_id, 'job_id': job.job_id, 'audio_id': job.audio_id,
+                'event': 'supplemental_extraction', 'requested_field_count': requested_field_count,
+                'resolved_field_keys': resolved_keys,
+            },
+        )
+    logger.info(
+        'extraction_service.supplemental_succeeded job_id=%s recording_id=%s requested=%s resolved=%s duration=%.2fs',
+        job.job_id, recording.recording_id, requested_field_count, len(resolved_keys), duration_seconds,
+    )
+
+
+def _refresh_quality_summary(edar_record, resolved_keys: list[str], new_warnings: list[dict]) -> None:
+    """Recomputes EdarRecord.quality_status/quality_report after a supplemental
+    merge (docs/phase10b-supplemental-audio.md §Quality summary refresh) - without
+    re-running assess_candidate over the whole candidate, which would require a
+    single transcript_text and so would wrongly re-check the original fields'
+    evidence against the supplemental transcript. Warnings for the fields this
+    merge touched are replaced with the targeted assessment's own warnings for
+    those exact fields; every other field's existing warnings are kept unchanged
+    verbatim. There are never merge-time errors here - only a validated
+    (non-INVALID) assessment ever reaches this function."""
+    old_report = edar_record.quality_report or {}
+    kept_warnings = [w for w in old_report.get('warnings', []) if w.get('field') not in resolved_keys]
+    warnings = kept_warnings + new_warnings
+
+    schema = load_schema()
+    rows = list(
+        EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI').values(
+            'field_key', 'known', 'confidence', 'source_transcript_segment'
+        )
+    )
+    metrics = compute_metrics(rows, schema, warnings, errors=[])
+    status = STATUS_VALIDATION_WARNING if warnings else STATUS_VALIDATED
+
+    edar_record.quality_status = status
+    edar_record.quality_report = {
+        'status': status,
+        'errors': [],
+        'warnings': warnings,
+        'metrics': metrics,
+        'evidenceMatchRule': old_report.get('evidenceMatchRule', EVIDENCE_MATCH_RULE),
+    }
+    edar_record.save(update_fields=['quality_status', 'quality_report'])
 
 
 def _record_failure(

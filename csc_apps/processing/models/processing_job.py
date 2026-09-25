@@ -26,6 +26,18 @@ class ProcessingJob(models.Model):
     recording = models.ForeignKey(
         verbose_name='Recording', to=Recording, on_delete=models.PROTECT, related_name='processing_jobs'
     )
+    # Which Audio row this STT/TRANSLATION/EXTRACTION job operates on (Phase 10B,
+    # docs/phase10b-supplemental-audio.md §Model changes) - null only for EXPORT
+    # jobs and any job predating this field; every STT/TRANSLATION/EXTRACTION job
+    # created going forward always sets it. This is what lets a Recording have more
+    # than one STT/TRANSLATION/EXTRACTION job (one set per Audio) without the
+    # existing auto-chaining (csc_apps.processing.stt_service/translation_service)
+    # colliding across them - see each service's get_or_create calls, now scoped by
+    # (recording, job_type, audio) instead of just (recording, job_type).
+    audio = models.ForeignKey(
+        verbose_name='Audio', to='recordings.Audio', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='+',
+    )
     job_type = models.CharField(verbose_name='Job Type', choices=JOB_TYPE_CHOICES, max_length=20)
     status = models.CharField(verbose_name='Status', choices=STATUS_CHOICES, max_length=10, default='PENDING')
 

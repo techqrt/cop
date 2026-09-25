@@ -308,11 +308,13 @@ class LoggingSecurityTests(TestCase):
             recording_id=self.recording.recording_id, extension='.wav',
             fileobj=SimpleUploadedFile('statement.wav', _TINY_VALID_WAV, content_type='audio/wav'),
         )
-        Audio.objects.create(
+        audio = Audio.objects.create(
             recording=self.recording, source='UPLOAD', storage_path=stored.storage_path,
             content_type='audio/wav', file_size_bytes=stored.size_bytes, checksum_sha256=stored.checksum_sha256,
         )
-        self.job = ProcessingJob.objects.create(recording=self.recording, job_type='STT', status='PENDING')
+        self.job = ProcessingJob.objects.create(
+            recording=self.recording, job_type='STT', audio=audio, status='PENDING'
+        )
 
     def test_provider_error_message_never_reaches_the_structured_log_line(self):
         fake_secret = 'Authorization: Bearer sk_live_should_never_be_logged_12345'

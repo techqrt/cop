@@ -43,15 +43,21 @@ section):
   requires an explicit, separately-audited action, not a default `DELETE` endpoint). No
   delete endpoint exists as of Phase 9.
 
-### Resource/role matrix (Phase 2-8, as implemented)
+### Resource/role matrix (Phase 2-10B, as implemented)
 
 | Resource/action | Owner | REVIEWER | ADMIN | Other officer |
 |---|---|---|---|---|
 | Upload (`POST /recordings/`) | ✅ (becomes owner) | ✅ (becomes owner) | ✅ (becomes owner) | n/a — every authenticated role may upload (OD-007 interim default) |
-| History/list (`GET /recordings/`) | own only | own only | own only | ✅ own only |
+| History/list (`GET /recordings/`, `GET /recordings/get_all/`) | own only | own only | own only | ✅ own only |
 | Detail (`GET /recordings/<id>/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+| Supplemental audio (`PUT /recordings/<id>/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
 | Approve (`POST /recordings/<id>/edar/approve/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
 | Export (`GET /recordings/<id>/export/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+
+`PUT /recordings/<id>/` (Phase 10B, `docs/phase10b-supplemental-audio.md`) reuses the
+exact same authorization check as `GET`/approve/export
+(`RecordingView._get_authorized_recording`) — one shared rule, not a fourth
+independently-maintained copy.
 
 The list/history scope (own recordings only, for every role including REVIEWER/ADMIN) is
 deliberately narrower than detail/approve/export (owner OR REVIEWER/ADMIN) — a confirmed

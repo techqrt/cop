@@ -9,6 +9,7 @@ from csc_apps.recordings.serializers.request.export_edar import ExportEdarReques
 from csc_apps.recordings.serializers.request.get_all_recordings import GetAllRecordingsRequestSerializer
 from csc_apps.recordings.serializers.request.get_recording import GetRecordingRequestSerializer
 from csc_apps.recordings.serializers.request.list_recordings import ListRecordingsRequestSerializer
+from csc_apps.recordings.serializers.request.supplement_audio import SupplementAudioRequestSerializer
 from csc_apps.recordings.serializers.request.upload_recording import RecordingUploadRequestSerializer
 from csc_apps.recordings.serializers.response.export_edar import RecordingExportResponseSerializer
 from csc_apps.recordings.serializers.response.get_all_recordings import RecordingGetAllResponseSerializer
@@ -23,6 +24,55 @@ _UPLOAD_DESCRIPTION = (
     'Recording and Audio rows, stores the audio privately, and queues a '
     'PENDING ProcessingJob for a future phase to consume - no transcription, '
     'translation, or extraction happens here (docs/phase1-audio-ingestion.md).'
+)
+
+_GET_DESCRIPTION = (
+    'Read-only. Get a recording\'s STT status (`processingStatus`), translation '
+    'status (`translationStatus`), eDAR extraction status (`extractionStatus`), '
+    'both transcript versions, and the AI-candidate eDAR field data once '
+    'available (docs/phase2-sarvam-stt.md §API endpoint, '
+    'docs/phase3-sarvam-translation.md §API response, '
+    'docs/phase4-gemini-edar-extraction.md §API behavior). Requires the caller '
+    'to be the recording\'s owning officer, or a REVIEWER/ADMIN. Never calls '
+    'Sarvam or Gemini and never starts or retries processing - this endpoint '
+    'only reads already-persisted state.\n\n'
+    '`transcript.original`/`transcript.english`/`edar` are each `null` until '
+    'their respective stage succeeds - never fabricated while processing is '
+    'incomplete. `translationStatus`/`extractionStatus` are `null` until the '
+    'preceding stage has succeeded (there is nothing to translate/extract '
+    'before that). `edar.fields` is a flat map of eDAR field_key -> '
+    '{value, known, confidence} for every field Gemini attempted - `known` is '
+    '"KNOWN" (evidence found) or "UNKNOWN" (attempted, none found); a value is '
+    'never fabricated for an UNKNOWN field. `edar.layer` is always "AI" - this '
+    'is the AI candidate, never overwritten by approval (docs/phase6-officer-'
+    'review-approval.md). `edar.reviewStatus` and `edar.approved` (null until '
+    'approved) reflect Phase 6 review state. `failureReason`/'
+    '`translationFailureReason`/`extractionFailureReason` each expose only a '
+    'controlled error code, never the raw provider error message. All of the '
+    'above continue to describe only the recording\'s ORIGINAL audio pipeline '
+    '(docs/phase10b-supplemental-audio.md) even after a supplemental audio has '
+    'been accepted via PUT on this same path - a supplemental audio\'s effect is '
+    'visible only through a field flipping from UNKNOWN to KNOWN in `edar.fields`.'
+)
+
+_SUPPLEMENT_DESCRIPTION = (
+    'Targeted supplemental audio for missing eDAR fields only '
+    '(docs/phase10b-supplemental-audio.md). Accepts audio ONLY (multipart/'
+    'form-data) - there is no `fields`/`target_fields`/`missing_fields` '
+    'parameter of any kind; which eDAR fields this audio can help resolve is '
+    'determined entirely server-side, from the recording\'s own current AI '
+    'eDAR state, never from anything the client sends. Requires the recording '
+    'to already have a completed AI eDAR extraction and not yet be approved '
+    '(same authorization as GET - the owning officer, or a REVIEWER/ADMIN); '
+    'rejected before any audio is stored if every eDAR field is already known. '
+    'Repeated supplemental uploads are supported without limit, each '
+    'accumulating whatever fields earlier ones left unresolved - an upload that '
+    'resolves nothing is a valid, non-error outcome, never fabricated. '
+    'Already-KNOWN AI fields and the APPROVED layer are never touched. Follows '
+    'the same asynchronous pattern as the original upload (docs/phase1-audio-'
+    'ingestion.md): this only stores the audio and queues a PENDING STT job, it '
+    'never runs STT/translation/extraction synchronously. The response is the '
+    'exact same shape GET returns.'
 )
 
 _LIST_DESCRIPTION = (
@@ -51,43 +101,15 @@ class RecordingViewController:
         # multipart/form-data (the audio file field) works without any override here.
         return RecordingView().upload_extract(params=request.params)
 
-    @extend_schema(
-        description=(
-            'Read-only. Get a recording\'s STT status (`processingStatus`), translation '
-            'status (`translationStatus`), eDAR extraction status (`extractionStatus`), '
-            'both transcript versions, and the AI-candidate eDAR field data once '
-            'available (docs/phase2-sarvam-stt.md §API endpoint, '
-            'docs/phase3-sarvam-translation.md §API response, '
-            'docs/phase4-gemini-edar-extraction.md §API behavior). Requires the caller '
-            'to be the recording\'s owning officer, or a REVIEWER/ADMIN. Never calls '
-            'Sarvam or Gemini and never starts or retries processing - this endpoint '
-            'only reads already-persisted state.\n\n'
-            '`transcript.original`/`transcript.english`/`edar` are each `null` until '
-            'their respective stage succeeds - never fabricated while processing is '
-            'incomplete. `translationStatus`/`extractionStatus` are `null` until the '
-            'preceding stage has succeeded (there is nothing to translate/extract '
-            'before that). `edar.fields` is a flat map of eDAR field_key -> '
-            '{value, known, confidence} for every field Gemini attempted - `known` is '
-            '"KNOWN" (evidence found) or "UNKNOWN" (attempted, none found); a value is '
-            'never fabricated for an UNKNOWN field. `edar.layer` is always "AI" - this '
-            'is the AI candidate, never overwritten by approval (docs/phase6-officer-'
-            'review-approval.md). `edar.reviewStatus` and `edar.approved` (null until '
-            'approved) reflect Phase 6 review state. `failureReason`/'
-            '`translationFailureReason`/`extractionFailureReason` each expose only a '
-            'controlled error code, never the raw provider error message.'
-        ),
-        parameters=[
-            OpenApiParameter(
-                name='Authorization', type=str, location=OpenApiParameter.HEADER,
-                required=True, description='Bearer <token>',
-            ),
-        ],
-        responses={200: RecordingDetailResponseSerializer},
-    )
     @api_view(['GET'])
     @SerializerValidations(serializer=GetRecordingRequestSerializer).validate
     def get(request: Request, recording_id: int) -> Response:
         return RecordingView().get_extract(params=request.params, recording_id=recording_id)
+
+    @api_view(['PUT'])
+    @SerializerValidations(serializer=SupplementAudioRequestSerializer).validate
+    def supplement(request: Request, recording_id: int) -> Response:
+        return RecordingView().supplement_extract(params=request.params, recording_id=recording_id)
 
     @extend_schema(
         description=(
@@ -216,3 +238,23 @@ class RecordingViewController:
         if request.method == 'GET':
             return RecordingViewController.list_recordings(request._request)
         return RecordingViewController.upload(request._request)
+
+    # `GET /recordings/<id>/` (Phase 2-9) and `PUT /recordings/<id>/` (Phase 10B
+    # supplemental audio) share one URL path, same reasoning and same drf-
+    # spectacular mechanism as recordings_root above - `get`/`supplement` remain
+    # the real, independently-decorated implementations; this wrapper exists only
+    # so drf-spectacular can see both operations on one function-based view.
+    @extend_schema(methods=['GET'], operation_id='recording_detail', description=_GET_DESCRIPTION,
+                    parameters=[OpenApiParameter(name='Authorization', type=str, location=OpenApiParameter.HEADER,
+                                                  required=True, description='Bearer <token>')],
+                    responses={200: RecordingDetailResponseSerializer})
+    @extend_schema(methods=['PUT'], operation_id='recording_supplement', description=_SUPPLEMENT_DESCRIPTION,
+                    request={'multipart/form-data': SupplementAudioRequestSerializer},
+                    parameters=[OpenApiParameter(name='Authorization', type=str, location=OpenApiParameter.HEADER,
+                                                  required=True, description='Bearer <token>')],
+                    responses={200: RecordingDetailResponseSerializer})
+    @api_view(['GET', 'PUT'])
+    def recording_detail_root(request: Request, recording_id: int) -> Response:
+        if request.method == 'PUT':
+            return RecordingViewController.supplement(request._request, recording_id=recording_id)
+        return RecordingViewController.get(request._request, recording_id=recording_id)

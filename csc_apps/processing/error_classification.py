@@ -35,6 +35,9 @@ NON_RETRYABLE_ERROR_CODES = {
     'EXTRACTION_AUTHENTICATION_FAILED',  # Phase 4 - Gemini 401/403 / missing GEMINI_API_KEY
     'EXTRACTION_UNSUPPORTED_INPUT',  # Phase 4 - Gemini 400/404, or an empty English transcript
     'EXTRACTION_EMPTY_OUTPUT',  # Phase 4 - Gemini returned no response body
+    'EXTRACTION_RECORD_ALREADY_APPROVED',  # Phase 10B - the eDAR record was approved
+    # after a supplemental job was queued but before it ran; retrying against the
+    # same approved record would reproduce the same refusal every time.
 }
 
 

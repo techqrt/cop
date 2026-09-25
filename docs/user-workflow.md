@@ -3,19 +3,24 @@
 ## 1. End-to-end officer journey
 
 ```
-1. Login                (email + password)
-2. Dashboard             (recording history: in-progress, processing, ready for review, completed)
-3. Create Recording       (start a new crash report)
-4a. Live Recording   OR   4b. Upload Audio
-        \                       /
-         \                     /
-          v                   v
-5. Processing            (STT -> translation -> eDAR extraction; officer can leave the screen)
-6. Transcript             (original-language + English transcript, read-only reference)
-7. Review eDAR             (AI-filled form, grouped by the 7 eDAR modules, edit any field)
-8. Completed Record        (officer approval -> immutable approved record)
-9. Recording History       (list/filter/search past recordings by state)
-10. Export (later phase)   (generate the file/format eDAR intake expects)
+1. Login                  (email + password)
+2. Dashboard               (recording history: in-progress, processing, ready for review, completed)
+3. Create Recording         (start a new crash report)
+4a. Live Recording   OR     4b. Upload Audio
+        \                         /
+         \                       /
+          v                     v
+5. Processing              (STT -> translation -> eDAR extraction; officer can leave the screen)
+6. Transcript               (original-language + English transcript, read-only reference)
+7. Review eDAR               (AI-filled form, grouped by the 7 eDAR modules, edit any field)
+7a. Add Supplemental Audio   (optional, repeatable - record/upload a short follow-up statement
+                              for whatever the AI left unknown; officer never picks which
+                              fields, the backend works that out itself - loops back into
+                              step 5's async processing for just that follow-up, then
+                              returns to step 7 with any newly-resolved fields filled in)
+8. Completed Record          (officer approval -> immutable approved record)
+9. Recording History         (list/filter/search past recordings by state)
+10. Export                   (generate the file/format eDAR intake expects)
 ```
 
 ## 2. Screen-by-screen notes
@@ -64,6 +69,19 @@ Fields with no supporting evidence are shown as explicitly unknown, never silent
 guessing. Vehicle and Casualty are repeating sub-sections (max 3 vehicles; casualties
 unbounded).
 
+### 7a. Add Supplemental Audio (Phase 10B)
+Instead of (or before) typing a missing field in by hand, the officer can record or upload a
+short follow-up statement — e.g. "the case number is FIR 45/2026" — and submit it against the
+same recording (`PUT /recordings/<id>/`, `docs/phase10b-supplemental-audio.md`). The client
+sends audio only; it never tells the server which field it's for — the server works that out
+itself from whatever the AI candidate currently has marked unknown, runs the same STT ->
+translation -> extraction pipeline as step 5 against just that follow-up, and merges anything
+it resolves into the AI-filled form from step 7 (an already-filled field, or the officer's own
+approved edits, are never touched). This is optional and repeatable — an officer can send
+several short follow-ups over time, each one only ever filling in whatever is still unknown at
+that moment — and it is never required before approval: a field can always be filled in by hand
+instead, or simply left unknown and approved as such.
+
 ### 8. Completed Record
 Once the officer approves, the record becomes the Layer-3 human-approved record
 (`docs/data-provenance.md`). The original AI output is retained alongside it, not
@@ -73,13 +91,34 @@ overwritten — an officer edit changes the approved copy, never the AI's origin
 Same list as the Dashboard, with search/filter/sort, following PMS's shared `GetAll`
 list-endpoint convention (`docs/pms-reference-analysis.md` §5).
 
-### 10. Export (later phase)
+### 10. Export
 Named in the source brief as a later capability ("Eventually export the completed eDAR
-record"). Format and destination are an open decision (`docs/open-decisions.md` OD-006), not
-designed in Phase 0.
+record") — implemented in Phase 8 (`GET /recordings/<id>/export/`,
+`docs/phase8-export.md`) as a JSON export of the `APPROVED` layer only, grouped by the 7
+eDAR modules; rejected until the record is approved. The destination system that
+consumes this export (eDAR intake) remains outside this project's scope
+(`docs/open-decisions.md` OD-006) — this screen only produces the document, it does not
+transmit it anywhere.
 
-## 3. What Phase 0 does not build
+## 3. Implementation status
 
-None of the above screens are implemented in Phase 0 — this document defines the target
-workflow so the Phase 0 domain model, state machine, and API architecture are shaped
-correctly for Phase 1 to build against, per `docs/product-scope.md` §4.
+This document described the target workflow before any of it was built (Phase 0), so the
+domain model, state machine, and API architecture could be shaped correctly for later
+phases to build against (`docs/product-scope.md` §4). As of this revision, every screen
+above is implemented end to end:
+
+| Screen | Endpoint(s) | Phase |
+|---|---|---|
+| 1. Login | `POST /auth/login/` | 0 |
+| 2/9. Dashboard / History | `GET /recordings/get_all/` (lightweight), `GET /recordings/` (filtered/paginated) | 10A, 7 |
+| 3/4a/4b. Create Recording | `POST /recordings/` | 1 |
+| 5. Processing | (async — `process_pending_stt_jobs`/`process_pending_translation_jobs`/`process_pending_extraction_jobs`, polled via `GET /recordings/<id>/`) | 2, 3, 4 |
+| 6/7. Transcript / Review eDAR | `GET /recordings/<id>/` | 2, 3, 4, 5 |
+| 7a. Add Supplemental Audio | `PUT /recordings/<id>/` | 10B |
+| 8. Completed Record | `POST /recordings/<id>/edar/approve/` | 6 |
+| 10. Export | `GET /recordings/<id>/export/` | 8 |
+
+No screen listed above remains unbuilt. `docs/api-architecture.md` §1 has the
+authoritative, current endpoint table (including request/response shapes, response
+envelope, and authorization rules) — this document stays the narrative/flow reference,
+not the contract of record for a specific request/response shape.

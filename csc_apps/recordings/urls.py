@@ -9,7 +9,7 @@ urlpatterns = [
     # cannot match "get_all" anyway, so this ordering isn't load-bearing for
     # correctness, only clarity.
     path('get_all/', RecordingViewController.get_all, name='recording_get_all'),
-    path('<int:recording_id>/', RecordingViewController.get, name='recording_detail'),
+    path('<int:recording_id>/', RecordingViewController.recording_detail_root, name='recording_detail'),
     path('<int:recording_id>/edar/approve/', RecordingViewController.approve_edar, name='recording_edar_approve'),
     path('<int:recording_id>/export/', RecordingViewController.export_edar, name='recording_export'),
 ]
