@@ -12,6 +12,7 @@ from csc_apps.authentication.models import User
 from csc_apps.common.common import Common
 from csc_apps.common.utils import Utils
 from csc_apps.edar import approval_service, export_service
+from csc_apps.edar.missing_fields import compute_missing_fields
 from csc_apps.edar.models import EdarFieldValue, EdarRecord
 from csc_apps.processing import event_types
 from csc_apps.processing.models import ProcessingEvent, ProcessingJob
@@ -44,6 +45,7 @@ _DUPLICATE_DETECTION_WINDOW = dt.timedelta(minutes=5)
 class RecordingView:
     def __init__(self):
         self.data_upload = 'Audio uploaded and queued for processing'
+        self.data_live_recording_created = 'Recording created for live voice session'
         self.recording_not_found = 'Recording not found'
         self.not_allowed = 'Not allowed to access this recording'
         self.data_list = 'Recordings retrieved successfully'
@@ -53,10 +55,56 @@ class RecordingView:
 
     @Common(response_handler=RecordingUploadResponseSerializer).exception_handler
     def upload_extract(self, params: UploadRecordingRequest) -> Response:
+        officer = User.objects.get(user_id=params.user_id)
+
+        # Phase 10 (docs/phase10-live-voice-agent.md §Recording creation): no
+        # audio at all means this is a live-voice Recording - created directly in
+        # CREATED status with no Audio/storage/STT-job/duplicate-check, none of
+        # which apply when there is no audio file yet. The officer starts a
+        # voice session against this recording_id next (POST /recordings/<id>/
+        # voice-session/). Everything below this branch is the original,
+        # unmodified audio-upload path (docs/phase1-audio-ingestion.md).
+        if params.audio is None:
+            recording = Recording.objects.create(
+                officer=officer,
+                status='CREATED',
+                gps_latitude=params.gps_latitude,
+                gps_longitude=params.gps_longitude,
+                gps_captured_at=(
+                    timezone.now()
+                    if params.gps_latitude is not None and params.gps_longitude is not None
+                    else None
+                ),
+                road_name=params.road_name,
+                police_station_jurisdiction=params.police_station_jurisdiction,
+                case_fir_number=params.case_fir_number,
+            )
+            ProcessingEvent.objects.create(
+                recording=recording,
+                event_type=event_types.RECORDING_CREATED,
+                metadata={'officer_id': officer.user_id, 'mode': 'live_voice'},
+            )
+            ActivityLog.record(
+                user=officer, action='Create', model='Recording',
+                details={'recording_id': recording.recording_id, 'mode': 'live_voice'},
+            )
+            return Response(
+                status=status.HTTP_201_CREATED,
+                data=Utils.success_response_data(
+                    message=self.data_live_recording_created,
+                    data={
+                        'recordingId': recording.recording_id,
+                        'status': recording.status,
+                        'audioId': None,
+                        'processingJobId': None,
+                        'possibleDuplicateOfRecordingId': None,
+                    },
+                ),
+            )
+
         # Validated before any database write, so a rejected upload never creates an
         # orphan Recording (docs/phase1-audio-ingestion.md §Validation).
         validated = validate_audio_upload(params.audio)
-        officer = User.objects.get(user_id=params.user_id)
 
         with transaction.atomic():
             recording = Recording.objects.create(
@@ -567,11 +615,20 @@ class RecordingView:
         )
         extraction_status = extraction_job.status if extraction_job else None
 
+        edar_record = EdarRecord.objects.filter(recording=recording).first()
         edar_data = None
         extraction_failure_reason = None
         extraction_issues = []
-        if extraction_status == 'SUCCEEDED':
-            edar_record = EdarRecord.objects.filter(recording=recording).first()
+        # Phase 10 (docs/phase10-live-voice-agent.md §Recording creation): a
+        # voice-driven recording has an EdarRecord (written directly by
+        # csc_apps.recordings.voice_service, turn by turn) but no EXTRACTION
+        # ProcessingJob at all - extraction_status is genuinely None for it,
+        # not PENDING/FAILED, since there is no job to poll. `edar_record is
+        # not None` is what makes eDAR data visible in that case; for the
+        # upload path this is always exactly equivalent to
+        # extraction_status == 'SUCCEEDED' (the only way an EdarRecord gets
+        # created there is a successful extraction job).
+        if extraction_status == 'SUCCEEDED' or (extraction_status is None and edar_record is not None):
             if edar_record is not None:
                 edar_data = self._build_edar_data(edar_record)
         elif extraction_status == 'FAILED':
@@ -579,10 +636,36 @@ class RecordingView:
             report = (extraction_job.provider_metadata or {}).get('validation_report') or {}
             extraction_issues = report.get('errors', [])
 
+        # Phase 10 (docs/phase10-live-voice-agent.md §Missing fields) - every
+        # currently-unresolved flat canonical field, with its question,
+        # whenever an AI eDAR candidate exists at all (not gated on
+        # extraction_status == 'SUCCEEDED' the way edar_data is above, so a
+        # voice-driven recording - which never has an EXTRACTION
+        # ProcessingJob - still gets this). Reuses the one canonical
+        # computation (csc_apps.edar.missing_fields.compute_missing_fields) -
+        # never a second, independently-maintained field/question list.
+        missing_fields = compute_missing_fields(edar_record) if edar_record is not None else {}
+
+        # Phase 10 (docs/phase10-live-voice-agent.md §Recording creation): a
+        # voice-driven recording never has an STT ProcessingJob at all
+        # (stt_job is None), unlike every upload-path recording, which always
+        # has one by the time an EdarRecord could exist - _build_message's own
+        # job-status-chain logic would otherwise report "Processing not yet
+        # complete" even once several fields have been resolved via voice
+        # turns, since processing_status defaults to 'PENDING' with no STT job
+        # to read a real status from.
+        if stt_job is None and edar_record is not None:
+            message = (
+                'Live voice session data retrieved successfully' if edar_data is not None
+                else 'Live voice session started; no eDAR data yet'
+            )
+        else:
+            message = self._build_message(processing_status, translation_status, extraction_status)
+
         return Response(
             status=status.HTTP_200_OK,
             data=Utils.success_response_data(
-                message=self._build_message(processing_status, translation_status, extraction_status),
+                message=message,
                 data={
                     'recordingId': recording.recording_id,
                     'processingStatus': processing_status,
@@ -594,6 +677,7 @@ class RecordingView:
                     'translationFailureReason': translation_failure_reason,
                     'extractionFailureReason': extraction_failure_reason,
                     'extractionIssues': extraction_issues,
+                    'missingFields': missing_fields,
                 },
             ),
         )

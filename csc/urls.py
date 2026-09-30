@@ -24,6 +24,11 @@ urlpatterns = [
     # path('activity/', include('csc_apps.activity_log.urls')),
 ]
 
+# Phase 10 Live Voice Agent's transcript endpoint is a WebSocket
+# (WS /recordings/<id>/transcript/, docs/phase10-live-voice-agent.md), routed
+# separately from this HTTP URLconf - see csc_apps/recordings/routing.py and
+# csc/asgi.py's ProtocolTypeRouter.
+
 if settings.DEBUG:
     # Local-dev convenience only. No endpoint relies on this public static() mount -
     # audio is stored under PRIVATE_STORAGE_ROOT, never MEDIA_ROOT (docs/security-

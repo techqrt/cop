@@ -251,10 +251,15 @@ class RecordingUploadAPITests(TestCase):
             response = self._upload(self._client_as(user))
             self.assertEqual(response.status_code, 201, (user.role, response.data))
 
-    def test_missing_audio_file_is_rejected_and_creates_nothing(self):
+    def test_missing_audio_file_creates_a_live_voice_recording(self):
+        # Phase 10 (docs/phase10-live-voice-agent.md §Recording creation): audio
+        # became optional - omitting it is no longer a validation failure, it's
+        # the live-voice creation path. Creates a Recording only (CREATED
+        # status), no Audio row, no STT ProcessingJob - see
+        # RecordingLiveVoiceCreationAPITests for the full behavior.
         response = self._client_as(self.officer).post('/recordings/', {}, format='multipart')
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(Recording.objects.count(), 0)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Recording.objects.count(), 1)
         self.assertEqual(ProcessingJob.objects.count(), 0)
 
     def test_unsupported_format_is_rejected_and_creates_nothing(self):
@@ -281,7 +286,13 @@ class RecordingUploadAPITests(TestCase):
         self.assertTrue(response.data['status'])
 
     def test_failure_response_follows_pms_envelope(self):
-        response = self._client_as(self.officer).post('/recordings/', {}, format='multipart')
+        # gps_latitude must be a float - a genuine serializer validation
+        # failure, unlike an omitted audio file which is now valid (Phase 10,
+        # docs/phase10-live-voice-agent.md §Recording creation).
+        response = self._client_as(self.officer).post(
+            '/recordings/', {'gps_latitude': 'not-a-number'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400, response.data)
         self.assertEqual(set(response.data.keys()), {'status', 'message', 'error'})
         self.assertFalse(response.data['status'])
 
@@ -609,6 +620,10 @@ class RecordingDetailTranslationAPITests(TestCase):
         expected_data_keys = {
             'recordingId', 'processingStatus', 'translationStatus', 'extractionStatus', 'transcript', 'edar',
             'failureReason', 'translationFailureReason', 'extractionFailureReason', 'extractionIssues',
+            # Phase 10 (docs/phase10-live-voice-agent.md §GET response) -
+            # every recording-detail response now includes missingFields,
+            # not just voice-driven ones.
+            'missingFields',
         }
         self.assertEqual(set(response.data['data'].keys()), expected_data_keys)
 

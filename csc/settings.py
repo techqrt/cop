@@ -45,6 +45,15 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
+    # Phase 10 - Live Voice Agent (docs/phase10-live-voice-agent.md). Adds the
+    # transcript WebSocket (csc_apps/recordings/consumers.py,
+    # csc_apps/recordings/routing.py) - the only WebSocket endpoint in this
+    # project. Listed before django.contrib.staticfiles per Channels' own
+    # documented placement (its runserver override only takes effect ahead of
+    # staticfiles, and only if `daphne` is also installed - `daphne` itself is
+    # not part of this change; see ASGI_APPLICATION below for what actually
+    # serves this outside of tests).
+    'channels',
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework_simplejwt',
@@ -96,15 +105,29 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'csc.wsgi.application'
 
+# Phase 10 - Live Voice Agent (docs/phase10-live-voice-agent.md §Channel
+# layer). WSGI_APPLICATION above is unchanged and still serves every existing
+# HTTP endpoint; ASGI_APPLICATION is additive, used only by the transcript
+# WebSocket (csc.asgi.application's ProtocolTypeRouter dispatches HTTP to the
+# same Django app WSGI would, and WS to csc_apps.recordings.routing).
+ASGI_APPLICATION = 'csc.asgi.application'
+
+# In-memory channel layer only (per-process, no Redis) - this endpoint never
+# broadcasts a message across consumers or processes (each connection only
+# ever talks to its own group-of-one), so channels-redis is not required.
+# Revisit if a real multi-process/multi-machine deployment needs cross-
+# process delivery - documented as a Phase 10 deployment open decision.
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    },
+}
+
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': Configurations.db_name,
-        'USER': Configurations.db_user,
-        'PASSWORD': Configurations.db_password,
-        'HOST': Configurations.db_host,
-        'PORT': Configurations.db_port,
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
 

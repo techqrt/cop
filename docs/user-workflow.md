@@ -6,11 +6,14 @@
 1. Login                  (email + password)
 2. Dashboard               (recording history: in-progress, processing, ready for review, completed)
 3. Create Recording         (start a new crash report)
-4a. Live Recording   OR     4b. Upload Audio
-        \                         /
-         \                       /
-          v                     v
+4a. Live Recording  OR  4b. Upload Audio  OR  4c. Live Voice Conversation (Phase 10)
+        \                    |                    /
+         \                   |                   /
+          v                  v                  v
 5. Processing              (STT -> translation -> eDAR extraction; officer can leave the screen)
+                             (4c instead talks to a voice agent running on the device itself -
+                              see 4c's own note below; eDAR fields fill in turn by turn over a
+                              WebSocket rather than after one batch STT/translation/extraction pass)
 6. Transcript               (original-language + English transcript, read-only reference)
 7. Review eDAR               (AI-filled form, grouped by the 7 eDAR modules, edit any field)
 7a. Add Supplemental Audio   (optional, repeatable - record/upload a short follow-up statement
@@ -50,6 +53,20 @@ The **original audio** is preserved as it is produced — it is never derived-an
 Officer selects a previously recorded audio file. Once uploaded, it enters the same
 downstream pipeline as a live recording (SOURCE REQUIREMENT: "the uploaded audio must enter
 the same downstream processing pipeline as live recordings after the audio is available.").
+
+### 4c. Live Voice Conversation (Phase 10)
+Instead of recording/uploading a single audio file, the officer starts a real-time
+conversation: Sarvam's Voice Agent runs directly on the Flutter side and asks
+questions out loud, and each answer's transcript is sent to Django over a
+WebSocket (`WS /recordings/<id>/transcript/`), which extracts whatever it
+supports - reusing the exact same Gemini extraction/validation core as every
+other input path (`docs/phase10-live-voice-agent.md`). Django never decides when
+or how a question is asked - only what is still missing, exposed to Flutter/the
+agent through the same `GET /recordings/<id>/` response every other path already
+uses (a new `missingFields` field-key-to-question map). The officer can end the conversation at any
+point; fields still unknown simply stay unknown, exactly like an unedited AI field
+from any other input path - review/approval (step 8) works identically regardless
+of which path produced the eDAR data.
 
 ### 5. Processing
 Non-blocking: STT, translation, and eDAR extraction run asynchronously
@@ -111,8 +128,9 @@ above is implemented end to end:
 |---|---|---|
 | 1. Login | `POST /auth/login/` | 0 |
 | 2/9. Dashboard / History | `GET /recordings/get_all/` (lightweight), `GET /recordings/` (filtered/paginated) | 10A, 7 |
-| 3/4a/4b. Create Recording | `POST /recordings/` | 1 |
-| 5. Processing | (async — `process_pending_stt_jobs`/`process_pending_translation_jobs`/`process_pending_extraction_jobs`, polled via `GET /recordings/<id>/`) | 2, 3, 4 |
+| 3/4a/4b. Create Recording | `POST /recordings/` (`audio` optional as of Phase 10) | 1, 10 |
+| 4c. Live Voice Conversation | `WS /recordings/<id>/transcript/`, plus `missingFields` on `GET /recordings/<id>/` | 10 |
+| 5. Processing | (async — `process_pending_stt_jobs`/`process_pending_translation_jobs`/`process_pending_extraction_jobs`, polled via `GET /recordings/<id>/`; 4c's path is synchronous per-turn instead) | 2, 3, 4 |
 | 6/7. Transcript / Review eDAR | `GET /recordings/<id>/` | 2, 3, 4, 5 |
 | 7a. Add Supplemental Audio | `PUT /recordings/<id>/` | 10B |
 | 8. Completed Record | `POST /recordings/<id>/edar/approve/` | 6 |

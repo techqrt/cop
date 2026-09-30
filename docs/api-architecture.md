@@ -14,13 +14,14 @@ under a path prefix in `csc/urls.py` — the same pattern as PMS's `pms/urls.py`
 | Domain | Path prefix | App | Status |
 |---|---|---|---|
 | Authentication | `/auth/` | `csc_apps.authentication` | Implemented (login) |
-| Recordings (upload) | `POST /recordings/` | `csc_apps.recordings` | Implemented — Phase 1, `docs/phase1-audio-ingestion.md` |
+| Recordings (upload) | `POST /recordings/` | `csc_apps.recordings` | Implemented — Phase 1, `docs/phase1-audio-ingestion.md`; `audio` made optional in Phase 10 (`docs/phase10-live-voice-agent.md`) — omitting it creates a live-voice Recording with no Audio/ProcessingJob |
 | Recordings (detail/transcripts/eDAR) | `GET /recordings/<id>/` | `csc_apps.recordings` | Implemented — Phase 2 (`docs/phase2-sarvam-stt.md` §7), extended Phase 3 with the English transcript (`docs/phase3-sarvam-translation.md` §11), extended Phase 4 with the AI eDAR candidate (`docs/phase4-gemini-edar-extraction.md` §15), extended Phase 5 with quality report, per-field evidence/confidence and structured validation issues (`docs/phase5-validation-provenance.md` §12) — no new endpoint |
 | Recordings (eDAR approval) | `POST /recordings/<id>/edar/approve/` | `csc_apps.recordings` | Implemented — Phase 6 (`docs/phase6-officer-review-approval.md`) — creates the APPROVED eDAR snapshot; AI rows are never modified |
 | Recordings (history/search) | `GET /recordings/` | `csc_apps.recordings` | Implemented — Phase 7 (`docs/phase7-history-search.md`) — shares its path with `POST /recordings/`; scoped to the requester's own recordings |
 | Recordings (approved eDAR export) | `GET /recordings/<id>/export/` | `csc_apps.recordings` | Implemented — Phase 8 (`docs/phase8-export.md`) — JSON export of the APPROVED layer only; rejected until approved |
 | Recordings (lightweight index) | `GET /recordings/get_all/` | `csc_apps.recordings` | Implemented — Phase 10A (`docs/phase10a-get-all-and-smoke-test.md`) — unpaginated `{recordingId, status, createdAt}` list, own recordings only |
 | Recordings (supplemental audio) | `PUT /recordings/<id>/` | `csc_apps.recordings` | Implemented — Phase 10B (`docs/phase10b-supplemental-audio.md`, ADR-024) — shares its path with `GET /recordings/<id>/`; audio-only request, server determines missing eDAR fields itself and merges any it resolves into the AI layer |
+| Recordings (transcript ingestion) | `WS /recordings/<id>/transcript/` | `csc_apps.recordings` | Implemented — Phase 10 (`docs/phase10-live-voice-agent.md`, ADR-026) — the one WebSocket endpoint in this project (Django Channels); JWT-authenticated via a `?token=` query parameter (browsers cannot set a custom header on a WS handshake); Sarvam's Voice Agent runs on the Flutter side, Django has no LiveKit responsibility at all |
 | Audio (raw retrieval) | `/recordings/<id>/audio/` | `csc_apps.recordings` | Deferred (OD-012) |
 | Processing | `/recordings/<id>/processing/` | `csc_apps.processing` | Superseded — folded into the combined detail endpoint above rather than built as its own sub-resource (docs/phase2-sarvam-stt.md §7) |
 | eDAR | `/recordings/<id>/edar/` | `csc_apps.edar` | Superseded — AI-candidate eDAR data folded into the combined detail endpoint above (docs/phase4-gemini-edar-extraction.md §15); officer editing was ultimately built as part of approval (`POST /recordings/<id>/edar/approve/`, Phase 6), not a separate editing endpoint |
@@ -106,8 +107,16 @@ immutable `APPROVED` layer (Phase 6); `GET /recordings/` history/search (Phase 7
 audit hardening across all of the above (no new endpoint);
 `GET /recordings/get_all/` lightweight recording index (Phase 10A);
 `PUT /recordings/<id>/` targeted supplemental audio, merged into the AI layer
-without a client-supplied field list (Phase 10B). `GET /recordings/<id>/` and
-`POST /recordings/<id>/edar/approve/` share one response shape
-(`RecordingView._build_detail_response`), and `PUT /recordings/<id>/` reuses that
-same shape rather than inventing a fourth. Documented only, not built: `Audio`
+without a client-supplied field list (Phase 10B);
+`WS /recordings/<id>/transcript/` incremental transcript-driven extraction,
+reusing the same Gemini extraction/validation core, plus `missingFields` on
+`GET /recordings/<id>/` (Phase 10 - the live voice agent input channel,
+`docs/phase10-live-voice-agent.md`, ADR-026; Sarvam's Voice Agent runs on the
+Flutter side, Django has no LiveKit responsibility).
+`GET /recordings/<id>/` and `POST /recordings/<id>/edar/approve/` share one
+response shape (`RecordingView._build_detail_response`), and
+`PUT /recordings/<id>/` reuses that same shape rather than inventing a fourth -
+Phase 10 taught that same builder a second way to know eDAR data exists (an
+`EdarRecord`'s presence, for a voice-driven Recording with no extraction
+`ProcessingJob`), not a new response shape. Documented only, not built: `Audio`
 (raw-file retrieval, OD-012).

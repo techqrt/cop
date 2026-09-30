@@ -496,3 +496,207 @@ merged, multi-source candidate.
 **Status:** Accepted.
 
 ---
+
+### ADR-025 — Live voice is a new input channel reusing the eDAR core synchronously; LiveKit/Sarvam are not built as a Django-hosted agent
+
+**Superseded by ADR-026.** This ADR was written against an initial
+understanding of the live-voice transport (Flutter+LiveKit+a Django-issued
+LiveKit token, with Sarvam's Voice Agent joining that LiveKit room and an
+HTTP "API Tool" callback into Django). A corrected architecture was given
+immediately after implementation: Sarvam's Voice Agent runs on the Flutter
+side directly, LiveKit is not part of Django's responsibility at all, and
+transcript ingestion is a WebSocket, not an HTTP callback. The `VoiceSession`
+model, the ProcessingEvent-based idempotency design, the synchronous-
+extraction-reusing-Phase-10B's-merge-mechanism decision, and the 28-flat-
+field scope limitation described below all carried over into ADR-026
+unchanged; the LiveKit-specific pieces (points 1 and 7-8 below, and the
+`POST /recordings/<id>/voice-session/` / `POST /voice-sessions/<id>/process/`
+HTTP endpoints) did not and were removed. Kept here, not deleted, for the
+same reason `docs/security-baseline.md` keeps its own corrected Phase 0 text
+visible rather than silently rewriting it - the historical record of what was
+built and why it changed stays legible.
+
+**Context (as originally understood):** Phase 10 replaces file-upload/batch-
+recording as the primary input method with a real-time conversation: Flutter
+joins a LiveKit room, Sarvam's own Voice Agent joins the same room and owns
+the conversation, and Django is called turn-by-turn to extract eDAR fields
+and decide the next question. This is an input-channel addition, not a
+redesign - the existing eDAR core (Gemini extraction, `csc_apps.edar.
+quality_validation`, the AI/APPROVED layer split, officer review/approval)
+had to remain the system of record, reused, not duplicated.
+
+**Decision:**
+1. **Django never joins the LiveKit room and never hosts a Voice Agent
+   process.** Its one LiveKit responsibility is issuing a short-lived,
+   room-scoped join token for Flutter (`csc_apps.processing.providers.livekit.
+   LiveKitVoiceRoomProvider`, verified against the real `livekit-api` SDK).
+   Room creation is left to LiveKit's own default (a room is created on the
+   first participant's join); dispatching Sarvam's Voice Agent into the room
+   is Sarvam/LiveKit-side configuration, not a Django API call - nothing in
+   the flow this phase was given shows Django calling out to Sarvam to start
+   an agent.
+2. **`VoiceSession` is the only new model** (`recording`, `room_name`,
+   `status`, accumulated `transcript_original`/`transcript_english`). No
+   `VoiceMessage`/`ConversationTurn`/per-turn table - idempotency (§24 of the
+   task) reuses the existing `ProcessingEvent` model, keyed on
+   `(voice_session_id, interaction_id)` in its own JSON `metadata`, storing the
+   exact response returned so a retried call is answered identically, not just
+   "without a duplicate write."
+3. **`POST /recordings/` (Phase 1's upload endpoint) gained an optional
+   `audio` field** rather than a new endpoint - omitting it creates a
+   Recording with no `Audio`/`ProcessingJob` at all, in `CREATED` status,
+   ready for a voice session to be started against it. The existing
+   audio-upload path is unchanged byte-for-byte (verified by the full existing
+   Phase 1-10B test suite passing unmodified).
+4. **One additive state-machine edge, `RECORDING -> READY_FOR_REVIEW`**
+   (`csc_apps.recordings.state_machine.ALLOWED_TRANSITIONS`) - a voice-driven
+   Recording has no `Audio` file, so it never reaches `UPLOADED`, the only
+   pre-existing edge out of `RECORDING`. Its first voice turn to resolve a
+   field transitions it straight to `READY_FOR_REVIEW`, the same state Gemini
+   extraction succeeding already puts an uploaded Recording into.
+5. **A voice turn's extraction is synchronous, not a `ProcessingJob`** - unlike
+   every other AI pipeline stage in this system, a live conversation cannot
+   poll-and-wait for an async job the way an upload can; Sarvam's Voice Agent
+   needs the next question back in the same call. It reuses Phase 10B's exact
+   targeted-extraction/merge mechanism (`csc_apps.processing.
+   extraction_service.merge_resolved_fields_into_ai_layer`, refactored out of
+   `_record_targeted_success` into a function both the async supplemental-
+   audio path and this synchronous voice path now share) rather than a second
+   implementation of "resolve some unknown fields from new text without
+   overwriting a known one." The one new gap this exposed and fixed:
+   `RecordingView._build_detail_response` only showed `edar` when an
+   `EXTRACTION` `ProcessingJob` had `SUCCEEDED` - a condition a voice-driven
+   Recording can never meet, since it has no such job. Fixed by also showing
+   `edar` whenever an `EdarRecord` exists and there is no `STT` job at all
+   (the voice-specific case), leaving the upload path's own condition
+   unchanged.
+6. **Incremental voice extraction is scoped to the 28 flat (non-repeating)
+   eDAR fields only** - Module D/E (vehicle/casualty) fields are out of scope
+   for this phase. Matching a vehicle or casualty mentioned in a later turn to
+   a stable index with no batch extraction to anchor it against is a
+   materially larger feature than a flat field flipping from `UNKNOWN` to
+   `KNOWN`, and every one of the task's own worked incremental-extraction
+   examples (§14) is a flat field. Documented as a known limitation, not
+   silently dropped.
+7. **The "API Tool -> Django" endpoint (`POST /voice-sessions/<id>/process/`)
+   authenticates via a static shared secret, not an officer JWT** - there is
+   no officer identity in this call at all. This required explicitly clearing
+   DRF's project-wide default `JWTAuthentication` for just this one view
+   (`@authentication_classes([])`): that authenticator runs before any view
+   code otherwise and hard-fails a non-JWT `Authorization` header itself,
+   rather than deferring to the view's own `require_auth=False` handling.
+8. **The request/response contract for this endpoint is explicitly marked
+   unverified/adapt-later.** This project was given the task's own conceptual
+   shape (`interactionId`/`callTranscript`, `{continue, nextQuestion}`), not
+   Sarvam's actual wire format for whatever mechanism calls into a customer
+   backend - isolated to one dataclass/serializer pair plus the first few
+   lines of `voice_service.process_turn_extract`, so adapting it later touches
+   nothing else (missing-field calculation, extraction, merge, and
+   next-question selection are all provider-payload-agnostic).
+
+**Consequences:** The eDAR core now has two ways to acquire a resolved field -
+batch (Phase 1-10B, via `Audio`/`Transcript`/`ProcessingJob`) and live
+per-turn (Phase 10, direct) - sharing the same validation, provenance, and
+AI/APPROVED separation either way. `GET /recordings/<id>/` had to learn a
+second way to know eDAR data exists (an `EdarRecord`'s mere presence, not only
+a successful `ProcessingJob`) - a real, if narrow, expansion of that endpoint's
+own logic, not just additive elsewhere. No real LiveKit credentials were
+available in this environment; the LiveKit-touching code path is verified
+against the real SDK in isolation (real JWT generation/verification) and
+proven to fail cleanly (400, not 500) when unconfigured, but never exercised
+against a live LiveKit server.
+
+**Status:** Superseded by ADR-026.
+
+---
+
+### ADR-026 — Transcript ingestion is a WebSocket, not an HTTP callback; Sarvam's Voice Agent and LiveKit are entirely outside Django
+
+**Context:** ADR-025's understanding of the live-voice transport was
+corrected: Sarvam's Voice Agent runs on the Flutter side, not as a separate
+service joining a Django-provisioned LiveKit room. Flutter sends each
+officer answer's transcript to Django directly, over a WebSocket, as it
+becomes available. Django's job stays exactly what ADR-025 already
+established for the eDAR core itself: reuse the existing extraction/
+validation/provenance pipeline to incrementally resolve fields, and never
+decide when or how a question gets asked - only what is still missing.
+
+**Decision:**
+1. **Django has no LiveKit responsibility at all.** No token issuance, no
+   room provisioning, no Voice Agent dispatch - all of that is now entirely
+   outside this backend's scope. The `LiveKitVoiceRoomProvider`/
+   `VoiceRoomProvider` abstraction and the `POST /recordings/<id>/
+   voice-session/` endpoint from ADR-025 were removed, not deprecated in
+   place - they described a call Django no longer needs to make.
+2. **Transcript ingestion is `WS /recordings/<recording_id>/transcript/`**,
+   introduced via Django Channels (`csc_apps/recordings/consumers.py`,
+   `csc_apps/recordings/routing.py`) - the first WebSocket endpoint in this
+   project (verified before implementing: no `channels`/`daphne`, no
+   `ASGI_APPLICATION`, existed at all). An in-memory channel layer
+   (`channels.layers.InMemoryChannelLayer`) is sufficient - this endpoint
+   never broadcasts a message across consumers or processes, so
+   `channels-redis` was not added; a real multi-process/multi-machine
+   deployment needing cross-process delivery is a documented open decision,
+   not solved here. `daphne` was added as a real, non-optional dependency
+   of this project's own test suite (`channels.testing.WebsocketCommunicator`
+   cannot even be imported without it - verified directly) and doubles as
+   the way to actually serve this endpoint outside of tests
+   (`daphne csc.asgi:application`); `manage.py runserver` alone still only
+   serves WSGI/HTTP.
+3. **The consumer authenticates with the same JWT every other endpoint
+   uses, via a query parameter** (`?token=<jwt>`), not a header - a browser
+   WebSocket handshake cannot carry a custom `Authorization` header (a real
+   client-side limitation, not a Django one), and Flutter Web inherits it.
+   `csc_apps.authentication.authentication.verify_access_token` was factored
+   out of `JWTAuthentication.authenticate` (a behavior-preserving refactor,
+   verified by the full existing authentication test suite passing
+   unmodified) specifically so the consumer reuses the exact same
+   verification logic rather than a second, WebSocket-only implementation.
+   Authorization reuses the identical owner-or-REVIEWER/ADMIN rule every
+   other recording endpoint applies (`csc_apps.recordings.voice_service.
+   authorize_recording_for_voice`).
+4. **The consumer is synchronous** (`JsonWebsocketConsumer`, not an async
+   consumer) - every service it calls (Django's ORM, the existing Sarvam/
+   Gemini providers) is itself synchronous, and Channels already runs a sync
+   consumer's handlers in a worker thread; wrapping every call in
+   `database_sync_to_async` would have added ceremony without changing what
+   actually runs. `VoiceSession` (introduced in ADR-025) is unchanged in
+   shape apart from dropping the now-meaningless `room_name` field - one row
+   per WebSocket connection, still the accumulator for
+   `transcript_original`/`transcript_english` and still not a per-turn
+   table (idempotency still reuses `ProcessingEvent`, unchanged from
+   ADR-025).
+5. **No STT and no translation-by-default inside the transcript path** - the
+   transcript already comes from Flutter/Sarvam's own STT. Translation only
+   runs when the incoming transcript isn't already English (reusing the
+   existing `SarvamTranslationProvider` directly and synchronously, same as
+   ADR-025) - a transcript with no `languageCode` given is treated as
+   already-English rather than assumed to need translation, a deliberate,
+   documented choice to avoid mistranslating text that may already be in
+   English.
+6. **`GET /recordings/<id>/` gained `missingFields`** - every currently-
+   unresolved flat canonical field, each paired with a question, computed by
+   one new function (`csc_apps.edar.missing_fields.compute_missing_fields`)
+   reused by nothing else. This is not voice-specific: any recording with an
+   `EdarRecord` gets `missingFields`, upload-driven or voice-driven alike -
+   the same single GET endpoint ADR-021's history/search and every other
+   phase already reads from, extended rather than duplicated. There is
+   deliberately no "next question" concept returned by the WebSocket itself
+   - Flutter/Sarvam read the full current gap from GET and decide what to
+   ask, exactly as specified.
+7. **The 28-flat-field extraction scope limitation and the `RecordingView.
+   _build_detail_response` `EdarRecord`-presence fix, both from ADR-025,
+   carry over unchanged** - neither was specific to the LiveKit transport.
+
+**Consequences:** Django's live-voice surface area shrank relative to
+ADR-025 (no token/room/agent-dispatch logic to maintain), at the cost of a
+new, previously-absent piece of infrastructure (Channels/ASGI) alongside the
+existing WSGI stack - both must now be served in any real deployment running
+this endpoint (documented in the phase doc as an open deployment
+consideration, not solved here). The eDAR core's two-ways-to-acquire-a-field
+duality from ADR-025 (batch via `ProcessingJob`, live via direct synchronous
+write) is unchanged.
+
+**Status:** Accepted.
+
+---

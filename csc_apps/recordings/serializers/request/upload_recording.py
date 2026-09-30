@@ -4,7 +4,12 @@ from csc_apps.recordings.dataclasses.request.upload_recording import UploadRecor
 
 
 class RecordingUploadRequestSerializer(serializers.Serializer):
-    audio = serializers.FileField(required=True, allow_empty_file=False)
+    # required=False as of Phase 10 (docs/phase10-live-voice-agent.md §Recording
+    # creation) - live-voice recordings are created with no audio file at all.
+    # The existing audio-upload path's own validation (csc_apps.recordings.
+    # validators.validate_audio_upload) is unchanged and still runs whenever
+    # audio IS provided; this only widens what's accepted, never weakens it.
+    audio = serializers.FileField(required=False, allow_empty_file=False, default=None)
 
     # Module A context an officer/client typically already has at recording-creation
     # time (docs/user-workflow.md §2 "Create Recording", docs/domain-model.md §3) -

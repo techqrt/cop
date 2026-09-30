@@ -52,3 +52,40 @@ urllib3==2.8.0
 distro==1.9.0
 sniffio==1.3.1
 tenacity==9.1.4
+
+# Phase 10 - Live Voice Agent (docs/phase10-live-voice-agent.md §Dependency
+# rule). Django Channels is the standard/only real way to add WebSocket
+# support to Django - the transcript-ingestion endpoint
+# (csc_apps/recordings/consumers.py) needs one, and this project had no
+# WebSocket infrastructure at all before this phase (verified: no
+# ASGI_APPLICATION, no channels/daphne installed). In-memory channel layer
+# only (csc/settings.py CHANNEL_LAYERS) - this endpoint never broadcasts
+# across consumers/processes, so channels-redis is not required; documented
+# as a Phase 10 deployment open decision if the real deployment runs multiple
+# processes/machines and needs cross-process delivery.
+channels==4.3.2
+# daphne is Channels' own reference ASGI server - required (not optional) to
+# even import channels.testing.WebsocketCommunicator (its __init__.py
+# unconditionally imports a daphne-dependent test helper - verified 2026-09
+# by attempting the import without it first), so it is a real dependency of
+# this project's own test suite, not a convenience add. It doubles as the
+# actual way to serve this app with WebSocket support outside of tests
+# (`daphne csc.asgi:application`) - runserver alone does not serve ASGI.
+# Everything below it is its own transitive dependency closure, pinned
+# flatly per this project's existing convention; verified no conflict with
+# any existing pin (`pip check` reports no broken requirements).
+daphne==4.2.3
+autobahn==26.7.1
+Automat==25.4.16
+cbor2==6.1.4
+constantly==23.10.4
+hyperlink==21.0.0
+Incremental==24.11.0
+msgpack==1.2.3
+packaging==26.3
+pyOpenSSL==26.4.0
+service-identity==26.1.0
+Twisted==26.4.0
+txaio==26.6.1
+ujson==6.0.0
+zope.interface==8.6

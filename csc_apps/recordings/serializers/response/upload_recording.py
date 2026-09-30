@@ -4,8 +4,11 @@ from rest_framework import serializers
 class RecordingUploadDataSerializer(serializers.Serializer):
     recordingId = serializers.IntegerField(read_only=True)
     status = serializers.CharField(read_only=True)
-    audioId = serializers.IntegerField(read_only=True)
-    processingJobId = serializers.IntegerField(read_only=True)
+    # allow_null as of Phase 10 (docs/phase10-live-voice-agent.md §Recording
+    # creation) - null for a live-voice Recording created with no audio, which
+    # has no Audio row and no STT ProcessingJob to report.
+    audioId = serializers.IntegerField(read_only=True, allow_null=True)
+    processingJobId = serializers.IntegerField(read_only=True, allow_null=True)
     # Set when a very recent (see csc_apps.recordings.views) identical-checksum
     # upload from the same officer already exists - a lightweight, safe-minimum
     # signal for "this looks like a duplicate submission" without blocking the

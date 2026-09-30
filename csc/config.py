@@ -45,3 +45,10 @@ class Configurations:
     # hardcode their fixed model choices - see GeminiExtractionProvider.MODEL.
     gemini_api_key = config('GEMINI_API_KEY', default='')
     gemini_http_timeout_seconds = config('GEMINI_HTTP_TIMEOUT_SECONDS', default=120, cast=int)
+
+    # Phase 10 - Live Voice Agent (docs/phase10-live-voice-agent.md
+    # §Configuration). Sarvam's Voice Agent runs on the Flutter side, not via a
+    # Django-hosted LiveKit integration - Django's only Phase 10 addition is
+    # the transcript WebSocket (csc_apps/recordings/consumers.py), which
+    # authenticates with the same JWT every other endpoint uses (no separate
+    # credential needed).

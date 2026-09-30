@@ -38,3 +38,12 @@ EXTRACTION_FAILED = 'extraction_failed'
 # / EXTRACTION_FAILED; no new event subsystem.
 QUALITY_VALIDATION_SUCCEEDED = 'quality_validation_succeeded'
 QUALITY_VALIDATION_FAILED = 'quality_validation_failed'
+
+# Phase 10 - Live Voice Agent (docs/phase10-live-voice-agent.md §Idempotency /
+# §Processing events). VOICE_SESSION_STARTED marks a LiveKit room/token being
+# issued; VOICE_TURN_PROCESSED marks one "API Tool -> Django" call handled -
+# this event's own `metadata` (voice_session_id + interaction_id +
+# the response returned) is what makes a retried interaction_id idempotent,
+# reusing ProcessingEvent rather than a new tracking table.
+VOICE_SESSION_STARTED = 'voice_session_started'
+VOICE_TURN_PROCESSED = 'voice_turn_processed'

@@ -43,21 +43,27 @@ section):
   requires an explicit, separately-audited action, not a default `DELETE` endpoint). No
   delete endpoint exists as of Phase 9.
 
-### Resource/role matrix (Phase 2-10B, as implemented)
+### Resource/role matrix (Phase 2-10, as implemented)
 
 | Resource/action | Owner | REVIEWER | ADMIN | Other officer |
 |---|---|---|---|---|
-| Upload (`POST /recordings/`) | ✅ (becomes owner) | ✅ (becomes owner) | ✅ (becomes owner) | n/a — every authenticated role may upload (OD-007 interim default) |
+| Upload (`POST /recordings/`, audio optional as of Phase 10) | ✅ (becomes owner) | ✅ (becomes owner) | ✅ (becomes owner) | n/a — every authenticated role may upload (OD-007 interim default) |
 | History/list (`GET /recordings/`, `GET /recordings/get_all/`) | own only | own only | own only | ✅ own only |
 | Detail (`GET /recordings/<id>/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
 | Supplemental audio (`PUT /recordings/<id>/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
+| Transcript WebSocket (`WS /recordings/<id>/transcript/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ (connection closed, code 4403) |
 | Approve (`POST /recordings/<id>/edar/approve/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
 | Export (`GET /recordings/<id>/export/`) | ✅ | ✅ (any recording) | ✅ (any recording) | ❌ |
 
-`PUT /recordings/<id>/` (Phase 10B, `docs/phase10b-supplemental-audio.md`) reuses the
-exact same authorization check as `GET`/approve/export
-(`RecordingView._get_authorized_recording`) — one shared rule, not a fourth
-independently-maintained copy.
+`PUT /recordings/<id>/` (Phase 10B, `docs/phase10b-supplemental-audio.md`) and
+`WS /recordings/<id>/transcript/` (Phase 10, `docs/phase10-live-voice-
+agent.md`, ADR-026) both reuse the exact same authorization check as
+`GET`/approve/export (`RecordingView`/`csc_apps.recordings.voice_service.
+authorize_recording_for_voice`) — one shared rule, not an independently-
+maintained copy per endpoint. The WebSocket authenticates with the same
+officer JWT as every other endpoint (`?token=` query parameter, since a
+browser WebSocket handshake cannot carry a custom header) - no new
+credential type was introduced for Phase 10.
 
 The list/history scope (own recordings only, for every role including REVIEWER/ADMIN) is
 deliberately narrower than detail/approve/export (owner OR REVIEWER/ADMIN) — a confirmed

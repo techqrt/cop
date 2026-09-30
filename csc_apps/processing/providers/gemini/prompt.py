@@ -23,14 +23,25 @@ from csc_apps.processing.providers.gemini.schema_adapter import GPS_FIELD_KEY, M
 # source instructions §50) so a later prompt change never retroactively looks like it
 # produced older extractions. Bumped from v1 to v2 for the three-call split - the
 # instructions each call receives changed, even though the underlying rules did not.
-PROMPT_VERSION = 'v2'
+# Bumped from v2 to v3 for rule 11 (strict-format fields) - live-verified 2026-09 that
+# gemini-3.8-flash, given a real relative/approximate time-of-day statement ("The
+# accident happened yesterday at around 7 PM"), returned crash_date='yesterday' and
+# crash_time='around 7 PM' even with the field's `example` format already in the
+# prompt - both fail schema_validation's strict date/time type check, and because
+# quality_validation.assess_candidate discards the WHOLE candidate (not just the
+# offending fields) when any entry is type-invalid, this silently zeroed out an
+# otherwise-resolvable turn. Rule 11 tells the model to resolve what it can into the
+# exact required format and null out what it can't, rather than emitting free text.
+PROMPT_VERSION = 'v3'
 
 # Phase 10B's supplemental/targeted extraction (docs/phase10b-supplemental-
 # audio.md) is a distinct prompt shape (a backend-selected field subset plus
 # entity-matching context, not the fixed flat/vehicles/casualties split) - versioned
 # independently so EdarFieldValue.extraction_version always shows whether a given
-# field came from the normal or the supplemental extraction path.
-TARGETED_PROMPT_VERSION = 'targeted-v1'
+# field came from the normal or the supplemental extraction path. Bumped alongside
+# PROMPT_VERSION since rule 11 lives in the shared rules text both prompt shapes
+# include - this is the same live-voice targeted path Phase 10 uses per turn.
+TARGETED_PROMPT_VERSION = 'targeted-v2'
 
 _ROLE_AND_TASK = """\
 You are a crash-scene information extraction system used by a police records \
@@ -76,7 +87,18 @@ value (not a generic high number), and the short verbatim (or near-verbatim) exc
 of the transcript that supports it. If value is null, confidence and evidence must \
 also be null.
 10. Do not decide GPS coordinates or police-station jurisdiction from map knowledge - \
-only report a jurisdiction if the officer actually names one aloud."""
+only report a jurisdiction if the officer actually names one aloud.
+11. A field with an "example" below has a STRICT output format (e.g. a date or a \
+24-hour HH:MM time) - the schema will reject any value that isn't in exactly that \
+shape. If the transcript gives a relative or approximate expression for such a field \
+(e.g. "around 7 PM", "yesterday", "this morning"), resolve it to that exact format \
+only if the transcript itself contains enough information to do so unambiguously \
+(e.g. "around 7 PM" -> "19:00" is fine - clock time is still exact even when the \
+officer's description was approximate). If it cannot be resolved to that exact format \
+from the transcript alone (e.g. "yesterday" with no stated reference date), the value \
+MUST be null - never output free text like "yesterday" or "around 7 PM" for such a \
+field, since a non-conforming value invalidates the entire extraction, not just that \
+one field."""
 
 _FLAT_STRUCTURED_OUTPUT_INSTRUCTION = """\
 Respond with structured JSON matching exactly the schema provided to you via this \

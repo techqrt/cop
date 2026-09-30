@@ -7,6 +7,43 @@ from csc.constants import Constants
 from csc_apps.authentication.models import User
 
 
+def verify_access_token(token: str) -> tuple[User, dict]:
+    """The actual JWT verification logic (docs/security-baseline.md §1) -
+    factored out of JWTAuthentication.authenticate so it has exactly one
+    implementation, reused by both the HTTP request path (below) and the
+    Phase 10 transcript WebSocket (csc_apps.recordings.consumers.
+    TranscriptConsumer.connect, docs/phase10-live-voice-agent.md §Security) -
+    a WebSocket handshake has no `request.headers` in the same sense an HTTP
+    view does, so the consumer calls this directly with a token pulled from
+    its own connection context, rather than a second, duplicated JWT-checking
+    implementation. Raises AuthenticationFailed on any problem, same as
+    before this refactor - existing behavior is unchanged."""
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
+    except jwt.ExpiredSignatureError:
+        raise AuthenticationFailed(Constants.access_token_expired)
+    except jwt.InvalidTokenError:
+        raise AuthenticationFailed(Constants.invalid_header)
+
+    user_row = User.get(user_id=payload.get('user_id'))
+    if user_row is None:
+        raise AuthenticationFailed('User not found')
+    if not user_row['is_active']:
+        raise AuthenticationFailed(Constants.forbidden_access)
+    if token != user_row['access_token']:
+        raise AuthenticationFailed(Constants.invalid_access_token)
+
+    try:
+        user = User.objects.get(user_id=payload['user_id'])
+    except User.DoesNotExist:
+        raise AuthenticationFailed('User not found')
+
+    if payload.get('role') and payload['role'] != user.role:
+        raise AuthenticationFailed('Token role mismatch')
+
+    return user, payload
+
+
 class JWTAuthentication(BaseAuthentication):
     """Ported from pms_apps/authentication/authentication.py
     (docs/pms-reference-analysis.md §7, docs/security-baseline.md §1).
@@ -28,28 +65,6 @@ class JWTAuthentication(BaseAuthentication):
             return None
 
         token = auth_header.split(' ', 1)[1]
-        try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationFailed(Constants.access_token_expired)
-        except jwt.InvalidTokenError:
-            raise AuthenticationFailed(Constants.invalid_header)
-
-        user_row = User.get(user_id=payload.get('user_id'))
-        if user_row is None:
-            raise AuthenticationFailed('User not found')
-        if not user_row['is_active']:
-            raise AuthenticationFailed(Constants.forbidden_access)
-        if token != user_row['access_token']:
-            raise AuthenticationFailed(Constants.invalid_access_token)
-
-        try:
-            user = User.objects.get(user_id=payload['user_id'])
-        except User.DoesNotExist:
-            raise AuthenticationFailed('User not found')
-
-        if payload.get('role') and payload['role'] != user.role:
-            raise AuthenticationFailed('Token role mismatch')
-
+        user, payload = verify_access_token(token)
         request.payload = payload
         return user, payload

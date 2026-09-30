@@ -376,6 +376,34 @@ class GeminiPromptModuleScopingTests(SimpleTestCase):
             self.assertIn(transcript, builder(transcript, schema))
 
 
+class GeminiStrictFormatRuleTests(SimpleTestCase):
+    """Regression for a real defect found via live E2E testing (2026-09): given
+    "The accident happened yesterday at around 7 PM.", gemini-3.8-flash returned
+    crash_date='yesterday' and crash_time='around 7 PM' - free text that fails
+    schema_validation's strict date/time type check - even though both fields'
+    `example` was already reaching the prompt. Because quality_validation.
+    assess_candidate discards the WHOLE candidate (not just the offending fields)
+    on any type error, this silently zeroed out an otherwise-resolvable turn -
+    reproduced against the real Gemini API, not assumed. Rule 11 (prompt.py
+    PROMPT_VERSION v3 / TARGETED_PROMPT_VERSION targeted-v2) is the fix; this
+    only guards that the instruction text remains present, since asserting the
+    model's actual compliance requires the live API (covered by the phase10
+    real-provider smoke test, not a unit test)."""
+
+    def test_flat_and_targeted_prompts_both_include_the_strict_format_rule(self):
+        from csc_apps.processing.providers.gemini.prompt import (
+            build_flat_extraction_prompt,
+            build_targeted_extraction_prompt,
+        )
+
+        schema = load_schema()
+        flat_prompt = build_flat_extraction_prompt('a transcript', schema)
+        targeted_prompt = build_targeted_extraction_prompt('a transcript', schema, ['crash_date', 'crash_time'])
+        for prompt in (flat_prompt, targeted_prompt):
+            self.assertIn('STRICT output format', prompt)
+            self.assertIn('value MUST be null', prompt)
+
+
 class GeminiTargetedSchemaAdapterTests(SimpleTestCase):
     """docs/phase10b-supplemental-audio.md §Targeted extraction -
     build_targeted_response_schema is given a backend-derived field-key subset

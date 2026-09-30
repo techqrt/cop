@@ -344,22 +344,84 @@ def _entity_context_lines(ai_rows: list) -> list[str]:
     return lines
 
 
+def merge_resolved_fields_into_ai_layer(
+    edar_record: EdarRecord, resolved_rows: list[dict], extraction_version: str | None,
+    new_warnings: list[dict],
+) -> tuple[list[str], bool]:
+    """The one place either targeted-resolution caller actually writes to the AI
+    layer - the async Phase 10B supplemental-audio job (_record_targeted_success)
+    and Phase 10's synchronous live-voice turn
+    (csc_apps.recordings.voice_service) both call this instead of each
+    implementing their own merge, so there is exactly one implementation of
+    "merge new information without ever overwriting an already-KNOWN field or
+    an approved record" (docs/phase10b-supplemental-audio.md §Already-KNOWN
+    protection, docs/phase10-live-voice-agent.md §Approval boundary) - not two.
+
+    Locks the EdarRecord row and rechecks review_status first (the approval-race
+    guard - a record approved after the caller's own earlier, unlocked check but
+    before this commit must never be written to), then locks and rechecks each
+    target EdarFieldValue row's `known` state (the concurrent-merge guard - a
+    field resolved by a different request that committed first is left alone).
+    Caller must already be inside `transaction.atomic()`.
+
+    Returns `(resolved_keys, approved_race)` - `approved_race=True` means nothing
+    was written because the record was already approved; the caller decides how
+    to report that (a job failure for the async path, a quiet no-op turn for the
+    synchronous voice path - docs/phase10-live-voice-agent.md §Approval
+    boundary)."""
+    locked_edar_record = EdarRecord.objects.select_for_update().get(pk=edar_record.pk)
+    if locked_edar_record.review_status == 'APPROVED':
+        return [], True
+
+    if not resolved_rows:
+        return [], False
+
+    # Merge only - never a delete-then-replace of the AI layer (docs/phase10b-
+    # supplemental-audio.md §Already-KNOWN protection): every already-KNOWN AI
+    # field, and every field outside this call's eligible set entirely, is left
+    # byte-unchanged. select_for_update plus a fresh known != 'KNOWN' recheck
+    # protects against a race with a concurrent request that targeted an
+    # overlapping field and committed first - this merge then only applies to
+    # whatever is still unresolved at commit time.
+    rows_by_key = {
+        v.field_key: v for v in EdarFieldValue.objects.select_for_update().filter(
+            edar_record=edar_record, layer='AI', field_key__in=[r['field_key'] for r in resolved_rows],
+        )
+    }
+    to_update = []
+    for row in resolved_rows:
+        field_value = rows_by_key.get(row['field_key'])
+        if field_value is None or field_value.known == 'KNOWN':
+            continue
+        field_value.known = row['known']
+        field_value.value = row['value']
+        field_value.confidence = row['confidence']
+        field_value.source_transcript_segment = row['source_transcript_segment']
+        field_value.source_start_time = row['source_start_time']
+        field_value.source_end_time = row['source_end_time']
+        field_value.extraction_version = extraction_version
+        to_update.append(field_value)
+    if to_update:
+        EdarFieldValue.objects.bulk_update(
+            to_update,
+            ['known', 'value', 'confidence', 'source_transcript_segment', 'source_start_time',
+             'source_end_time', 'extraction_version'],
+        )
+    resolved_keys = [fv.field_key for fv in to_update]
+    if resolved_keys:
+        _refresh_quality_summary(edar_record, resolved_keys, new_warnings)
+    return resolved_keys, False
+
+
 def _record_targeted_success(
     job: ProcessingJob, recording, edar_record, resolved_rows: list[dict], requested_field_count: int,
     duration_seconds: float, extraction_version: str | None = None, targeted_warnings: list[dict] | None = None,
 ) -> None:
     with transaction.atomic():
-        # Second, narrower half of the approval race guard (see the caller's own
-        # check): locks the EdarRecord row and re-reads review_status immediately
-        # before merging anything, closing the window between the caller's check
-        # and this commit (e.g. the time spent inside the provider.extract() call
-        # above). Under Postgres this also serializes against a concurrent
-        # approve_edar() write to the same row; under SQLite select_for_update()
-        # is a no-op (Django's own documented behavior), so this narrower half is
-        # correctness-under-Postgres only - the caller's earlier check is what
-        # covers the realistic case regardless of database engine.
-        locked_edar_record = EdarRecord.objects.select_for_update().get(pk=edar_record.pk)
-        if locked_edar_record.review_status == 'APPROVED':
+        resolved_keys, approved_race = merge_resolved_fields_into_ai_layer(
+            edar_record, resolved_rows, extraction_version, targeted_warnings or [],
+        )
+        if approved_race:
             _record_failure(
                 job, recording,
                 ProviderError(
@@ -369,43 +431,6 @@ def _record_targeted_success(
                 duration_seconds=duration_seconds,
             )
             return
-
-        resolved_keys: list[str] = []
-        if resolved_rows:
-            # Merge only - never a delete-then-replace of the AI layer (docs/
-            # phase10b-supplemental-audio.md §Already-KNOWN protection): every
-            # already-KNOWN AI field, and every field outside this call's eligible
-            # set entirely, is left byte-unchanged. select_for_update plus a fresh
-            # known != 'KNOWN' recheck protects against a race with a concurrent
-            # supplemental request that targeted an overlapping field and committed
-            # first - this merge then only applies to whatever is still unresolved
-            # at commit time.
-            rows_by_key = {
-                v.field_key: v for v in EdarFieldValue.objects.select_for_update().filter(
-                    edar_record=edar_record, layer='AI', field_key__in=[r['field_key'] for r in resolved_rows],
-                )
-            }
-            to_update = []
-            for row in resolved_rows:
-                field_value = rows_by_key.get(row['field_key'])
-                if field_value is None or field_value.known == 'KNOWN':
-                    continue
-                field_value.known = row['known']
-                field_value.value = row['value']
-                field_value.confidence = row['confidence']
-                field_value.source_transcript_segment = row['source_transcript_segment']
-                field_value.source_start_time = row['source_start_time']
-                field_value.source_end_time = row['source_end_time']
-                field_value.extraction_version = extraction_version
-                to_update.append(field_value)
-            if to_update:
-                EdarFieldValue.objects.bulk_update(
-                    to_update,
-                    ['known', 'value', 'confidence', 'source_transcript_segment', 'source_start_time',
-                     'source_end_time', 'extraction_version'],
-                )
-            resolved_keys = [fv.field_key for fv in to_update]
-            _refresh_quality_summary(edar_record, resolved_keys, targeted_warnings or [])
 
         job.status = 'SUCCEEDED'
         job.completed_at = timezone.now()

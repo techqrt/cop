@@ -12,4 +12,8 @@ urlpatterns = [
     path('<int:recording_id>/', RecordingViewController.recording_detail_root, name='recording_detail'),
     path('<int:recording_id>/edar/approve/', RecordingViewController.approve_edar, name='recording_edar_approve'),
     path('<int:recording_id>/export/', RecordingViewController.export_edar, name='recording_export'),
+    # Phase 10 Live Voice Agent (docs/phase10-live-voice-agent.md) has no new
+    # HTTP endpoint here - the transcript ingestion path is a WebSocket
+    # (csc_apps/recordings/routing.py), and the existing GET
+    # /recordings/<id>/ above already carries the new `missingFields`.
 ]

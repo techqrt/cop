@@ -8,7 +8,15 @@ from csc_apps.recordings.models.recording import Recording
 
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     'CREATED': {'RECORDING', 'UPLOADED'},
-    'RECORDING': {'UPLOADED'},
+    # RECORDING -> READY_FOR_REVIEW added in Phase 10 (docs/phase10-live-voice-
+    # agent.md §Recording state machine): a live-voice Recording never produces
+    # an Audio file, so it never reaches UPLOADED - the only pre-existing edge
+    # out of RECORDING. Its first successful voice-turn extraction transitions it
+    # straight to READY_FOR_REVIEW, the same state Gemini extraction succeeding
+    # already puts an uploaded Recording into (csc_apps.processing.
+    # extraction_service._record_success). UPLOADED is kept too, unchanged, for
+    # any live-recording flow that still ends in a batch audio upload.
+    'RECORDING': {'UPLOADED', 'READY_FOR_REVIEW'},
     'UPLOADED': {'PROCESSING'},
     'PROCESSING': {'READY_FOR_REVIEW', 'FAILED'},
     'READY_FOR_REVIEW': {'IN_REVIEW'},

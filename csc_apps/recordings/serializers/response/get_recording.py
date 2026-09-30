@@ -115,6 +115,15 @@ class RecordingDetailDataSerializer(serializers.Serializer):
     extractionFailureReason = serializers.CharField(read_only=True, allow_null=True)
     # Structured, value-free validation errors when extraction failed validation.
     extractionIssues = EdarIssueSerializer(many=True, read_only=True)
+    # Phase 10 (docs/phase10-live-voice-agent.md §GET response) - every
+    # currently-unresolved flat canonical field, keyed by field_key, mapped
+    # to its question. Empty (never null) whenever there is no eDAR
+    # candidate yet or nothing is missing - Sarvam/Flutter's voice agent
+    # reads this to keep a live conversation going; Django never decides
+    # when/how to ask, only what is still missing (task §11). `field_key` is
+    # always a real key from schemas/edar-schema.json - never a Flutter
+    # label or Sarvam's own checklist name.
+    missingFields = serializers.DictField(child=serializers.CharField(), read_only=True)
 
 
 class RecordingDetailResponseSerializer(serializers.Serializer):
