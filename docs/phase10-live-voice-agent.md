@@ -213,11 +213,35 @@ call fails, or whose result fails deterministic validation resolves nothing
 and is not an error - the connection stays open, the conversation continues
 with the same fields still missing.
 
-**Known limitation**: incremental extraction is scoped to the 28 flat
-fields. Vehicle/casualty (Module D/E) fields are out of scope for this
-phase - matching a vehicle or casualty mentioned in a later transcript to a
-stable index with no batch extraction to anchor it is a materially larger
-feature than a flat field flipping `UNKNOWN` → `KNOWN`.
+**Vehicle/casualty (Module D/E) fields** (added 2026-09, on request, after
+Flutter's own 48-field checklist surfaced that these 20 fields - already
+part of the canonical 42-field schema, just never targeted by the
+incremental path - weren't reachable through voice): once a flat count
+field (`number_of_vehicles_involved` / `number_of_persons_involved`)
+becomes `KNOWN`, `csc_apps.recordings.voice_service._bootstrap_entity_fields`
+creates `UNKNOWN` rows for that many vehicle/casualty slots (capped at the
+schema's vehicle max of 3, and `MAX_CASUALTIES` for casualties) - lazily,
+never before the count itself is known, so a slot is never pre-guessed into
+existing. Those rows then flow through the exact same `target_fields`
+→ `extract()` → `assess_candidate` → `merge_resolved_fields_into_ai_layer`
+pipeline as every flat field, with no change to any of those four steps.
+`csc_apps.edar.missing_fields.compute_missing_fields` was widened the same
+way - it only ever reads rows that already exist, it never invents a slot
+from the count alone, and each entry gets an entity-aware question (`"For
+vehicle 1, what was the vehicle type?"`) since a bare field name doesn't
+say which vehicle. This applies to `missingFields` for **every** recording
+(voice or upload-driven), not just the voice flow, since both share this
+one function - the audio/batch pipeline already creates these same rows
+via its own `vehicle_count`/`casualty_count` extraction metadata
+(`csc_apps.processing.extraction_service._assess`), they simply weren't
+being read by `compute_missing_fields` before.
+
+One real, documented limitation remains: resolving a count field and
+resolving that entity's own details are two separate Gemini calls by
+design (the incremental path asks one target-field set per turn), so an
+officer who states both "two vehicles" and "the first was a sedan" in the
+very same utterance will have the vehicle-type detail land on the next
+turn instead - a one-turn lag, not a dropped value.
 
 ## 7. Idempotency
 

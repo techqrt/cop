@@ -34,12 +34,13 @@ from csc_apps.processing.extraction_service import (
     _entity_context_lines,
     _entry_from_extracted_field,
     _max_entity_index,
+    _module_max,
     merge_resolved_fields_into_ai_layer,
 )
 from csc_apps.processing.models import ProcessingEvent
 from csc_apps.processing.providers.base import ProviderError
 from csc_apps.processing.providers.gemini.provider import GeminiExtractionProvider
-from csc_apps.processing.providers.gemini.schema_adapter import flat_field_keys
+from csc_apps.processing.providers.gemini.schema_adapter import MAX_CASUALTIES, flat_field_keys, repeating_field_keys
 from csc_apps.processing.providers.sarvam.translation_provider import SarvamTranslationProvider
 from csc_apps.recordings.models.recording import Recording
 from csc_apps.recordings.models.voice_session import VoiceSession
@@ -228,14 +229,17 @@ def _resolve_turn(edar_record: EdarRecord, english_text: str) -> list[str]:
     """Incremental per-transcript extraction (task §7) - reuses Phase 10B's
     exact targeted-extraction/merge mechanism (csc_apps.processing.
     extraction_service), applied to one transcript message instead of one
-    supplemental-audio upload. Scoped to the 28 flat (non-repeating) eDAR
-    fields only - see docs/phase10-live-voice-agent.md §Known limitations
-    for why vehicle/casualty fields are deliberately out of scope for
-    transcript-driven incremental extraction in this phase."""
+    supplemental-audio upload. Covers the 28 flat (non-repeating) eDAR
+    fields plus vehicle/casualty (Module D/E) slots once their count is
+    known - see _bootstrap_entity_fields."""
     schema = load_schema()
     ai_rows = list(EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI'))
     if not ai_rows:
         ai_rows = _bootstrap_flat_fields(edar_record, schema)
+
+    new_entity_rows = _bootstrap_entity_fields(edar_record, schema, ai_rows)
+    if new_entity_rows:
+        ai_rows = ai_rows + new_entity_rows
 
     eligible_keys = [r.field_key for r in ai_rows if r.known != 'KNOWN']
     if not eligible_keys:
@@ -293,3 +297,38 @@ def _bootstrap_flat_fields(edar_record: EdarRecord, schema: dict) -> list[EdarFi
         for key in flat_field_keys(schema)
     ])
     return list(EdarFieldValue.objects.filter(edar_record=edar_record, layer='AI'))
+
+
+def _bootstrap_entity_fields(
+    edar_record: EdarRecord, schema: dict, ai_rows: list[EdarFieldValue],
+) -> list[EdarFieldValue]:
+    """Creates UNKNOWN rows for vehicle/casualty slots once their count is
+    already KNOWN - a slot is never pre-guessed before something establishes
+    it exists (same principle Phase 10B's entity matching already follows),
+    just using the flat count field itself (number_of_vehicles_involved /
+    number_of_persons_involved) as that trigger rather than waiting to
+    organically stumble onto a numbered mention. Idempotent (only creates
+    rows that don't already exist) and safe to call on every turn - a count
+    that becomes KNOWN on turn N makes its entity slots eligible starting
+    turn N+1, the same one-turn lag Phase 10B's own entity handling already
+    has for a newly-introduced vehicle/casualty."""
+    by_key = {r.field_key: r for r in ai_rows}
+    new_rows: list[EdarFieldValue] = []
+
+    for count_field_key, entity, cap in (
+        ('number_of_vehicles_involved', 'vehicle', _module_max(schema, 'vehicle')),
+        ('number_of_persons_involved', 'casualty', MAX_CASUALTIES),
+    ):
+        count_row = by_key.get(count_field_key)
+        if count_row is None or count_row.known != 'KNOWN' or not isinstance(count_row.value, int):
+            continue
+        slots = min(count_row.value, cap)
+        for index in range(1, slots + 1):
+            for base_key in repeating_field_keys(schema, entity):
+                key = f'{entity}.{index}.{base_key}'
+                if key not in by_key:
+                    new_rows.append(EdarFieldValue(edar_record=edar_record, field_key=key, layer='AI', known='UNKNOWN'))
+
+    if new_rows:
+        EdarFieldValue.objects.bulk_create(new_rows)
+    return new_rows

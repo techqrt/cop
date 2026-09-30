@@ -200,6 +200,56 @@ class MissingFieldsGetResponseAPITests(TestCase):
         field_def = resolve_field_key(key, schema=schema)
         self.assertIn(field_def['name'].lower(), missing[key].lower())
 
+    def test_includes_vehicle_and_casualty_fields_once_a_slot_exists(self):
+        """A vehicle/casualty slot's fields appear in missingFields once rows
+        exist for it - whether created by the batch/audio pipeline's own
+        vehicle_count/casualty_count, or by
+        csc_apps.recordings.voice_service._bootstrap_entity_fields once
+        number_of_vehicles_involved/number_of_persons_involved is KNOWN.
+        This test creates the rows directly rather than going through either
+        pipeline, since compute_missing_fields only reads existing rows -
+        it never invents a slot on its own (2026-09 clarification)."""
+        edar_record = EdarRecord.objects.create(recording=self.recording)
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='number_of_vehicles_involved', layer='AI', known='KNOWN', value=2,
+        )
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='vehicle.1.vehicle_type', layer='AI', known='UNKNOWN',
+        )
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='vehicle.2.vehicle_registration_number', layer='AI', known='UNKNOWN',
+        )
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='casualty.1.injury_severity', layer='AI', known='UNKNOWN',
+        )
+
+        response = self._client().get(f'/recordings/{self.recording.recording_id}/')
+        missing = response.data['data']['missingFields']
+        self.assertIn('vehicle.1.vehicle_type', missing)
+        self.assertIn('vehicle.2.vehicle_registration_number', missing)
+        self.assertIn('casualty.1.injury_severity', missing)
+        self.assertIn('vehicle 1', missing['vehicle.1.vehicle_type'].lower())
+        self.assertIn('vehicle 2', missing['vehicle.2.vehicle_registration_number'].lower())
+        self.assertIn('casualty 1', missing['casualty.1.injury_severity'].lower())
+
+    def test_never_invents_a_slot_that_has_no_rows(self):
+        """number_of_vehicles_involved says 2, but only vehicle.1.* rows
+        exist (e.g. the bootstrap for vehicle 2 hasn't run yet) -
+        missingFields must never fabricate vehicle.2.* entries out of the
+        count alone."""
+        edar_record = EdarRecord.objects.create(recording=self.recording)
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='number_of_vehicles_involved', layer='AI', known='KNOWN', value=2,
+        )
+        EdarFieldValue.objects.create(
+            edar_record=edar_record, field_key='vehicle.1.vehicle_type', layer='AI', known='UNKNOWN',
+        )
+
+        response = self._client().get(f'/recordings/{self.recording.recording_id}/')
+        missing = response.data['data']['missingFields']
+        self.assertIn('vehicle.1.vehicle_type', missing)
+        self.assertFalse(any(k.startswith('vehicle.2.') for k in missing))
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -427,6 +477,106 @@ class TranscriptWebSocketTests(TransactionTestCase):
         self.assertEqual(road_name_row.value, 'NH 48')
         crash_time_row = EdarFieldValue.objects.get(edar_record=edar_record, field_key='crash_time', layer='AI')
         self.assertEqual(crash_time_row.known, 'KNOWN')
+
+    # --- Vehicle/casualty entity fields, once their count is known --------
+
+    def test_vehicle_fields_become_eligible_the_turn_after_count_is_known(self):
+        """Turn 1 resolves number_of_vehicles_involved=2 - vehicle.1.*/
+        vehicle.2.* rows should exist (bootstrapped) by the start of turn 2,
+        and turn 2 should be able to target and resolve one."""
+        async def run():
+            communicator = WebsocketCommunicator(application, self._path(token=self.owner_token))
+            await communicator.connect()
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE1:
+                MockE1.return_value.extract.return_value = _extraction_result(
+                    field('number_of_vehicles_involved', 2),
+                )
+                await communicator.send_json_to({
+                    'interactionId': 't1', 'transcript': 'two vehicles were involved', 'languageCode': 'en-IN',
+                })
+                await communicator.receive_json_from()
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE2:
+                MockE2.return_value.extract.return_value = _extraction_result(
+                    field('vehicle.1.vehicle_type', 'sedan'),
+                )
+                await communicator.send_json_to({
+                    'interactionId': 't2', 'transcript': 'the first was a sedan', 'languageCode': 'en-IN',
+                })
+                response2 = await communicator.receive_json_from()
+                called_kwargs = MockE2.return_value.extract.call_args.kwargs
+            await communicator.disconnect()
+            return response2, called_kwargs
+        response2, called_kwargs = _run(run())
+
+        # vehicle.1.*/vehicle.2.* were eligible targets for turn 2's call.
+        self.assertIn('vehicle.1.vehicle_type', called_kwargs['target_fields'])
+        self.assertIn('vehicle.2.vehicle_type', called_kwargs['target_fields'])
+        self.assertEqual(response2['data']['resolvedFieldKeys'], ['vehicle.1.vehicle_type'])
+
+        edar_record = EdarRecord.objects.get(recording=self.recording)
+        row = EdarFieldValue.objects.get(edar_record=edar_record, field_key='vehicle.1.vehicle_type', layer='AI')
+        self.assertEqual(row.value, 'sedan')
+        # vehicle.2.* rows exist too (bootstrapped), just still UNKNOWN.
+        other = EdarFieldValue.objects.get(
+            edar_record=edar_record, field_key='vehicle.2.vehicle_registration_number', layer='AI',
+        )
+        self.assertEqual(other.known, 'UNKNOWN')
+
+    def test_vehicle_slots_capped_at_schema_max_of_three(self):
+        async def run():
+            communicator = WebsocketCommunicator(application, self._path(token=self.owner_token))
+            await communicator.connect()
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE1:
+                MockE1.return_value.extract.return_value = _extraction_result(
+                    field('number_of_vehicles_involved', 5),
+                )
+                await communicator.send_json_to({
+                    'interactionId': 't1', 'transcript': 'five vehicles were involved', 'languageCode': 'en-IN',
+                })
+                await communicator.receive_json_from()
+            # The bootstrap reacts to a count that's already KNOWN at the
+            # *start* of a turn - a second turn is what actually triggers it
+            # for the count turn 1 itself just resolved.
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE2:
+                MockE2.return_value.extract.return_value = _extraction_result()
+                await communicator.send_json_to({
+                    'interactionId': 't2', 'transcript': 'continuing', 'languageCode': 'en-IN',
+                })
+                await communicator.receive_json_from()
+            await communicator.disconnect()
+        _run(run())
+        edar_record = EdarRecord.objects.get(recording=self.recording)
+        self.assertTrue(
+            EdarFieldValue.objects.filter(edar_record=edar_record, field_key__startswith='vehicle.3.').exists()
+        )
+        self.assertFalse(
+            EdarFieldValue.objects.filter(edar_record=edar_record, field_key__startswith='vehicle.4.').exists()
+        )
+
+    def test_casualty_fields_become_eligible_the_turn_after_count_is_known(self):
+        async def run():
+            communicator = WebsocketCommunicator(application, self._path(token=self.owner_token))
+            await communicator.connect()
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE1:
+                MockE1.return_value.extract.return_value = _extraction_result(
+                    field('number_of_persons_involved', 1),
+                )
+                await communicator.send_json_to({
+                    'interactionId': 't1', 'transcript': 'one person was involved', 'languageCode': 'en-IN',
+                })
+                await communicator.receive_json_from()
+            with patch('csc_apps.recordings.voice_service.GeminiExtractionProvider') as MockE2:
+                MockE2.return_value.extract.return_value = _extraction_result(
+                    field('casualty.1.injury_severity', 'minor injury'),
+                )
+                await communicator.send_json_to({
+                    'interactionId': 't2', 'transcript': 'minor injuries', 'languageCode': 'en-IN',
+                })
+                response2 = await communicator.receive_json_from()
+            await communicator.disconnect()
+            return response2
+        response2 = _run(run())
+        self.assertEqual(response2['data']['resolvedFieldKeys'], ['casualty.1.injury_severity'])
 
     def test_transcript_resolving_nothing_is_success_not_error(self):
         async def run():
